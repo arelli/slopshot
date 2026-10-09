@@ -1,0 +1,22 @@
+[package]
+name = "slopshot"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
+eframe = "0.33"
+image = { version = "0.25.10", default-features = false, features = ["jpeg"] }
+libc = "0.2.190"
+rawler = "0.8.0"
+rfd = "0.17"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+
+# Our own pixel loops (exposure, downscale) are too slow unoptimized.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
