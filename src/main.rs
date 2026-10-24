@@ -4,7 +4,7 @@ mod pixels;
 mod raw;
 
 use eframe::egui::{
-    self, pos2, vec2, Align, Color32, ColorImage, Key, Layout, Pos2, Rect, RichText, Sense, Stroke,
+    self, pos2, vec2, Align, Align2, Color32, ColorImage, Key, Layout, Pos2, Rect, RichText, Sense, Stroke,
     TextureHandle, TextureOptions, UiBuilder, Vec2,
 };
 use serde::{Deserialize, Serialize};
@@ -25,6 +25,11 @@ const GAP: f32 = 8.0;
 const GREEN: Color32 = Color32::from_rgb(70, 190, 90);
 const RED: Color32 = Color32::from_rgb(220, 70, 60);
 const GOLD: Color32 = Color32::from_rgb(240, 190, 40);
+/// Film strip under the large view: total height, sprocket band height (top and
+/// bottom), photos shown each side of the current one.
+const STRIP_H: f32 = 92.0;
+const SPROCKET_H: f32 = 14.0;
+const STRIP_SIDE: (usize, usize) = (3, 6);
 
 fn main() -> eframe::Result {
     let opts = eframe::NativeOptions {
@@ -411,6 +416,8 @@ struct App {
     zoom_pct: f32,
     show_info: bool,
     show_focus: bool,
+    /// Film strip of neighbouring photos under the large view.
+    show_strip: bool,
     /// Photo in the large view and when it got there (full res loads after a short dwell).
     viewer_at: Option<(usize, std::time::Instant)>,
     export: Option<Export>,
@@ -458,6 +465,7 @@ impl App {
             zoom_pct: 0.0,
             show_info: true,
             show_focus: true,
+            show_strip: true,
             viewer_at: None,
             export: None,
             status: String::new(),
@@ -626,7 +634,10 @@ impl App {
 
     fn apply(&mut self, a: Action) {
         match a {
-            Action::Select(i) => self.selected = Some(i),
+            Action::Select(i) => {
+                self.selected = Some(i);
+                self.scroll_to_selected = true; // keep the grid on it (film strip clicks)
+            }
             Action::Open(i) => {
                 self.selected = Some(i);
                 self.viewing = true;
@@ -659,6 +670,7 @@ impl App {
             if i.key_pressed(Key::A) { self.auto_bright = !self.auto_bright }
             if i.key_pressed(Key::I) { self.show_info = !self.show_info }
             if i.key_pressed(Key::F) { self.show_focus = !self.show_focus }
+            if i.key_pressed(Key::S) { self.show_strip = !self.show_strip }
             if self.viewing {
                 if i.key_pressed(Key::Z) { self.zoom_cmd = Some(ZoomCmd::Toggle(None)) }
                 if i.key_pressed(Key::Plus) || i.key_pressed(Key::Equals) { self.zoom_cmd = Some(ZoomCmd::By(1.25, None)) }
@@ -926,6 +938,7 @@ impl App {
                      Z  100% at focus point / fit\n\
                      Double-click  100% here / fit\n\
                      F  show focus point\n\
+                     S  film strip\n\
                      Drag  pan",
                 )
                 .small()
@@ -975,7 +988,7 @@ impl App {
         actions
     }
 
-    fn viewer(&mut self, ui: &mut egui::Ui, idx: usize) -> Vec<Action> {
+    fn viewer(&mut self, ui: &mut egui::Ui, idx: usize, vis: &[usize]) -> Vec<Action> {
         let mut actions = Vec::new();
         let ev = self.display_ev(idx);
         if let Thumb::Ready(s) = &mut self.photos[idx].thumb {
@@ -997,6 +1010,16 @@ impl App {
         let (manual, auto, preview_auto) = (self.ev, self.auto_bright, self.photos[idx].auto_ev);
         if let Some((_, s, auto_ev, _)) = &mut self.hires {
             s.set_ev(hires_ev(manual, auto, *auto_ev, preview_auto));
+        }
+
+        // Film strip: the current photo and its neighbours in the grid's order
+        // (filters and sort apply), as many per side as fit, within STRIP_SIDE.
+        let strip = if self.show_strip { strip_slots(vis, idx, ui.available_width()) } else { (Vec::new(), 0.0) };
+        for &i in strip.0.iter().flatten() {
+            let ev = self.display_ev(i);
+            if let Thumb::Ready(s) = &mut self.photos[i].thumb {
+                s.set_ev(ev);
+            }
         }
 
         let p = &self.photos[idx];
@@ -1026,6 +1049,7 @@ impl App {
             } else if let Some((_, _, _, source)) = &self.hires {
                 ui.label(RichText::new(format!("full res ({source})")).weak());
             }
+            ui.toggle_value(&mut self.show_strip, "🎞 Strip").on_hover_text("Show neighbouring photos below (S)");
             ui.separator();
             ui.label(RichText::new(format!("display {ev:+.1} EV")).weak());
         });
@@ -1039,7 +1063,16 @@ impl App {
             _ => None,
         });
         let hires_tex = self.hires.as_ref().map(|h| &h.1.tex);
-        let (rect, resp) = ui.allocate_exact_size(ui.available_size(), Sense::click_and_drag());
+        let mut area = ui.available_size();
+        if !strip.0.is_empty() {
+            area.y = (area.y - STRIP_H - 4.0).max(0.0);
+        }
+        let (rect, resp) = ui.allocate_exact_size(area, Sense::click_and_drag());
+        if !strip.0.is_empty() {
+            ui.add_space(4.0);
+            let (strip_rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), STRIP_H), Sense::hover());
+            film_strip(ui, &self.photos, &strip.0, strip.1, idx, strip_rect, &mut actions);
+        }
         let Some(layout_tex) = preview.or(hires_tex) else {
             ui.put(rect, egui::Spinner::new().size(32.0));
             return actions;
@@ -1218,6 +1251,90 @@ fn mark_controls(ui: &mut egui::Ui, p: &Photo, idx: usize, size: f32, actions: &
     actions.extend(flag_btn(ui, Flag::Rejected, "✖", RED, "Reject (X)"));
 }
 
+/// Slots for the film strip: the current photo in the middle and `n` neighbours
+/// per side in `vis` order (`None` past either end, so the current photo stays
+/// centred), plus the frame width. `n` is as many as fit in `width`, within
+/// STRIP_SIDE; at the minimum the frames shrink instead.
+fn strip_slots(vis: &[usize], idx: usize, width: f32) -> (Vec<Option<usize>>, f32) {
+    let Some(pos) = vis.iter().position(|&i| i == idx) else { return (Vec::new(), 0.0) };
+    let frame_h = STRIP_H - 2.0 * SPROCKET_H - 8.0;
+    let cell = frame_h * 1.5 + GAP;
+    let fit = ((width / cell).floor() as usize).saturating_sub(1) / 2;
+    let n = fit.clamp(STRIP_SIDE.0, STRIP_SIDE.1);
+    let frame_w = ((width - GAP) / (2 * n + 1) as f32 - GAP).min(frame_h * 1.5);
+    let slots = (-(n as isize)..=n as isize).map(|d| pos.checked_add_signed(d).and_then(|p| vis.get(p).copied())).collect();
+    (slots, frame_w)
+}
+
+/// A strip of film: dark base, sprocket holes along both edges, and a frame per
+/// slot holding that photo's thumbnail (so it works for any format slopshot can
+/// preview). Clicking a frame moves the large view to it.
+fn film_strip(
+    ui: &egui::Ui,
+    photos: &[Photo],
+    slots: &[Option<usize>],
+    frame_w: f32,
+    current: usize,
+    rect: Rect,
+    actions: &mut Vec<Action>,
+) {
+    let painter = ui.painter().with_clip_rect(rect);
+    painter.rect_filled(rect, 4.0, Color32::from_gray(14));
+    // Sprocket holes, spaced like 35mm film relative to the strip height.
+    let hole = vec2(8.0, 6.0);
+    let pitch = 16.0;
+    let mut x = rect.left() + pitch / 2.0;
+    while x < rect.right() {
+        for y in [rect.top() + SPROCKET_H / 2.0, rect.bottom() - SPROCKET_H / 2.0] {
+            painter.rect_filled(Rect::from_center_size(pos2(x, y), hole), 1.5, Color32::from_gray(52));
+        }
+        x += pitch;
+    }
+
+    let frame_h = rect.height() - 2.0 * SPROCKET_H - 8.0;
+    let total = slots.len() as f32 * (frame_w + GAP) - GAP;
+    let mut left = rect.center().x - total / 2.0;
+    for (k, slot) in slots.iter().enumerate() {
+        let frame = Rect::from_min_size(pos2(left, rect.top() + SPROCKET_H + 4.0), vec2(frame_w, frame_h));
+        left += frame_w + GAP;
+        painter.rect_filled(frame, 2.0, Color32::from_gray(26));
+        let Some(i) = *slot else { continue };
+        let p = &photos[i];
+        let resp = ui.interact(frame, ui.id().with(("strip", k)), Sense::click()).on_hover_text(&p.name);
+        let pic = match &p.thumb {
+            Thumb::Ready(s) => paint_fit(ui, &s.tex, frame.shrink(2.0), dim(p)),
+            Thumb::Pending => {
+                painter.text(frame.center(), Align2::CENTER_CENTER, "…", egui::FontId::proportional(14.0), Color32::GRAY);
+                frame
+            }
+            Thumb::Failed => {
+                painter.text(frame.center(), Align2::CENTER_CENTER, "—", egui::FontId::proportional(14.0), Color32::GRAY);
+                frame
+            }
+        };
+        if p.mark.rating > 0 {
+            let stars = "★".repeat(p.mark.rating as usize);
+            let at = pic.left_bottom() + vec2(3.0, -2.0);
+            for (d, c) in [(vec2(1.0, 1.0), Color32::from_black_alpha(200)), (Vec2::ZERO, GOLD)] {
+                painter.text(at + d, Align2::LEFT_BOTTOM, &stars, egui::FontId::proportional(10.0), c);
+            }
+        }
+        let border = match p.mark.flag {
+            _ if i == current => Some(Stroke::new(2.5, ui.visuals().selection.stroke.color)),
+            Flag::Picked => Some(Stroke::new(2.0, GREEN)),
+            Flag::Rejected => Some(Stroke::new(2.0, RED)),
+            Flag::None if resp.hovered() => Some(Stroke::new(1.0, Color32::from_gray(160))),
+            Flag::None => None,
+        };
+        if let Some(b) = border {
+            painter.rect_stroke(frame, 2.0, b, egui::StrokeKind::Outside);
+        }
+        if resp.clicked() && i != current {
+            actions.push(Action::Select(i));
+        }
+    }
+}
+
 fn card(ui: &mut egui::Ui, p: &Photo, idx: usize, selected: bool, show_focus: bool, actions: &mut Vec<Action>) {
     let (rect, _) = ui.allocate_exact_size(vec2(CARD_W, CARD_H), Sense::hover());
     let vis = ui.visuals();
@@ -1303,12 +1420,40 @@ impl eframe::App for App {
                 return;
             }
             let actions = match (self.viewing, self.selected) {
-                (true, Some(idx)) => self.viewer(ui, idx),
+                (true, Some(idx)) => self.viewer(ui, idx, &vis),
                 _ => self.grid(ui, &vis),
             };
             for a in actions {
                 self.apply(a);
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strip_neighbour_count() {
+        let vis: Vec<usize> = (0..40).collect();
+        // Narrow: still 3 per side, frames shrink to fit.
+        let (s, w) = strip_slots(&vis, 20, 300.0);
+        assert_eq!(s.len(), 7);
+        assert!(w * 7.0 + GAP * 8.0 <= 300.0 + 0.01);
+        // Wide: capped at 6 per side.
+        let (s, _) = strip_slots(&vis, 20, 4000.0);
+        assert_eq!(s, (14..=26).map(Some).collect::<Vec<_>>());
+        // Medium width picks in between.
+        let (s, _) = strip_slots(&vis, 20, 844.0);
+        assert_eq!(s.len(), 9);
+    }
+
+    #[test]
+    fn strip_follows_visible_order_and_pads_ends() {
+        let vis = vec![7, 3, 9, 1];
+        let (s, _) = strip_slots(&vis, 7, 300.0);
+        assert_eq!(s, vec![None, None, None, Some(7), Some(3), Some(9), Some(1)]);
+        assert!(strip_slots(&vis, 5, 300.0).0.is_empty()); // filtered out
     }
 }
