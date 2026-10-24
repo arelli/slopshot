@@ -1,3 +1,4 @@
+mod cr3;
 mod exposure;
 mod pixels;
 mod raw;
@@ -128,7 +129,7 @@ impl Photo {
 fn is_raw(p: &Path) -> bool {
     p.extension()
         .and_then(|e| e.to_str())
-        .is_some_and(|e| e.eq_ignore_ascii_case("arw") || e.eq_ignore_ascii_case("awr"))
+        .is_some_and(|e| ["arw", "awr", "cr3"].iter().any(|x| e.eq_ignore_ascii_case(x)))
 }
 
 // ---------- background decoding ----------
@@ -226,7 +227,7 @@ fn decode(path: &Path, shrink: u32) -> (Option<image::RgbImage>, Option<raw::Raw
 
 /// Full resolution for zooming; the ~1.6k preview is too small. In order of preference
 /// (fastest, and same look as the preview first): the camera JPG shot alongside,
-/// a full-size JPEG embedded in the ARW (newer bodies), or developing the RAW.
+/// a full-size JPEG embedded in the RAW (newer Sony bodies, every CR3), or developing the RAW.
 fn decode_hires(path: &Path) -> Option<(image::RgbImage, &'static str)> {
     let jpg = sibling_jpg(path);
     let embedded = || {
@@ -788,7 +789,7 @@ impl App {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 if ui.button("📂 Open folder…").clicked() {
-                    if let Some(dir) = rfd::FileDialog::new().set_title("Open folder with ARW files").pick_folder() {
+                    if let Some(dir) = rfd::FileDialog::new().set_title("Open folder with RAW files").pick_folder() {
                         self.open_folder(dir);
                     }
                 }
@@ -1289,7 +1290,7 @@ impl eframe::App for App {
         egui::CentralPanel::default().show(ctx, |ui| {
             if self.folder.is_none() {
                 ui.centered_and_justified(|ui| {
-                    if ui.button(RichText::new("📂 Open a folder of ARW files…").size(20.0)).clicked() {
+                    if ui.button(RichText::new("📂 Open a folder of ARW/CR3 files…").size(20.0)).clicked() {
                         if let Some(dir) = rfd::FileDialog::new().pick_folder() {
                             self.open_folder(dir);
                         }
@@ -1298,7 +1299,7 @@ impl eframe::App for App {
                 return;
             }
             if self.photos.is_empty() {
-                ui.centered_and_justified(|ui| ui.label("No .ARW files in this folder."));
+                ui.centered_and_justified(|ui| ui.label("No .ARW or .CR3 files in this folder."));
                 return;
             }
             let actions = match (self.viewing, self.selected) {
