@@ -95,7 +95,8 @@ pub(crate) fn read(t: &mut Tiff, pick: Pick) -> Option<RawMeta> {
         match &h[4..8] {
             b"moov" => {
                 moov = Some((off + hdr, size - hdr));
-                t.extend_head((off + size).saturating_add(TAIL).min(MAX_BOX) as usize);
+                // `size` is straight from the file (up to 64 bits), so every sum saturates.
+                t.extend_head(off.saturating_add(size).saturating_add(TAIL).min(MAX_BOX) as usize);
             }
             b"uuid" if size >= hdr + 16 => {
                 let id = &h[hdr as usize..hdr as usize + 16];
@@ -412,38 +413,115 @@ mod tests {
         assert_eq!(af_focus(&grid).unwrap().frame, Some((10.0, 10.0)));
     }
 
-    /// Point at a folder of RAWs to print what's read from each:
-    /// `SLOPSHOT_SAMPLES=~/Pictures/shoot cargo test samples -- --nocapture`
-    #[test]
-    fn samples() {
-        let Some(dir) = std::env::var_os("SLOPSHOT_SAMPLES") else { return };
-        let mut paths: Vec<_> = std::fs::read_dir(dir).unwrap().flatten().map(|e| e.path()).collect();
-        paths.sort();
-        for p in paths.iter().filter(|p| p.is_file()) {
-            for pick in [Pick::Preview, Pick::FullSize] {
-                let Some(m) = crate::raw::read(p, pick) else {
-                    println!("{}: not readable", p.display());
-                    break;
-                };
-                let e = &m.exif;
-                let dims = m.preview.as_deref().and_then(|j| image::load_from_memory(j).ok()).map(|i| (i.width(), i.height()));
-                println!(
-                    "{} {}: jpeg {:?} bytes, decoded {:?} | {:?} {:?} | {} | {}x{} orient {} full_jpeg {} rating {:?} focus {:?}",
-                    p.file_name().unwrap().to_string_lossy(),
-                    if pick == Pick::Preview { "preview" } else { "full" },
-                    m.preview.as_ref().map(Vec::len),
-                    dims,
-                    m.date,
-                    e.camera(),
-                    e.summary(),
-                    e.width,
-                    e.height,
-                    m.orientation,
-                    e.full_jpeg,
-                    e.rating,
-                    e.focus.map(|f| (f.sensor, f.at, f.frame)),
-                );
+    fn jpeg(w: u32, h: u32) -> Vec<u8> {
+        let mut out = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 50)
+            .encode(&vec![90u8; (w * h * 3) as usize], w, h, image::ExtendedColorType::Rgb8)
+            .unwrap();
+        out
+    }
+
+    /// A TIFF block with SHORT/ASCII entries, as in CMT1.
+    fn tiff(entries: &[(u16, &[u8])]) -> Vec<u8> {
+        let mut v = b"II*\0\x08\0\0\0".to_vec();
+        let data_at = 8 + 2 + entries.len() * 12 + 4;
+        let mut data: Vec<u8> = Vec::new();
+        v.extend((entries.len() as u16).to_le_bytes());
+        for &(tag, val) in entries {
+            let (typ, count) = if val.len() == 2 { (3u16, 1u32) } else { (2, val.len() as u32) };
+            v.extend(tag.to_le_bytes());
+            v.extend(typ.to_le_bytes());
+            v.extend(count.to_le_bytes());
+            if val.len() <= 4 {
+                v.extend(val);
+                v.extend(std::iter::repeat_n(0, 4 - val.len()));
+            } else {
+                v.extend(((data_at + data.len()) as u32).to_le_bytes());
+                data.extend(val);
             }
+        }
+        v.extend([0; 4]);
+        v.extend(data);
+        v
+    }
+
+    /// One track: trak/mdia/minf/stbl with a CRAW sample entry (tagged JPEG or
+    /// not), sample size and chunk offset.
+    fn trak(w: u16, h: u16, jpeg_tag: bool, size: u32, off: u64) -> Vec<u8> {
+        let mut entry = vec![0u8; 24];
+        entry.extend(w.to_be_bytes());
+        entry.extend(h.to_be_bytes());
+        entry.extend([0u8; 54]); // child boxes start 90 bytes into the entry
+        entry.extend(bx(if jpeg_tag { b"JPEG" } else { b"CMP1" }, &[0; 4]));
+        let mut stsd = vec![0, 0, 0, 0, 0, 0, 0, 1];
+        stsd.extend(bx(b"CRAW", &entry));
+        let stsz = [&[0u8; 4][..], &size.to_be_bytes(), &1u32.to_be_bytes()].concat();
+        let co64 = [&[0u8; 4][..], &1u32.to_be_bytes(), &off.to_be_bytes()].concat();
+        let stbl = [bx(b"stsd", &stsd), bx(b"stsz", &stsz), bx(b"co64", &co64)].concat();
+        bx(b"trak", &bx(b"mdia", &bx(b"minf", &bx(b"stbl", &stbl))))
+    }
+
+    /// A small but complete CR3: ftyp, moov (Canon uuid with CMT1 + a raw track
+    /// + the full-size JPEG track), XMP uuid, PRVW uuid, mdat.
+    fn fake_cr3(prvw: &[u8], full: &[u8], tag_full: bool) -> Vec<u8> {
+        let ftyp = bx(b"ftyp", b"crx \0\0\0\x01crx isom");
+        let cmt1 = tiff(&[(0x010F, b"Canon\0"), (0x0110, b"Canon EOS RP\0"), (0x0112, &6u16.to_le_bytes())]);
+        let canon = bx(b"uuid", &[&CANON_UUID[..], &bx(b"CMT1", &cmt1)].concat());
+        let xmp = bx(b"uuid", &[&XMP_UUID[..], b"<rdf:Description><xmp:Rating>3</xmp:Rating>"].concat());
+        let mut pv = b"\0\0\0\0\0\0\0\x01".to_vec();
+        let mut body = vec![0, 0, 0, 0, 0, 1];
+        body.extend(1620u16.to_be_bytes());
+        body.extend(1080u16.to_be_bytes());
+        body.extend([0, 1]);
+        body.extend((prvw.len() as u32).to_be_bytes());
+        body.extend(prvw);
+        pv.extend(bx(b"PRVW", &body));
+        let prvw_box = bx(b"uuid", &[&PREVIEW_UUID[..], &pv].concat());
+        // moov's size doesn't depend on the offsets, so lay it out once to learn where mdat lands.
+        let moov = |raw_off: u64, full_off: u64| {
+            let tracks = [trak(6000, 4000, false, 64, raw_off), trak(3000, 2000, tag_full, full.len() as u32, full_off)];
+            bx(b"moov", &[canon.clone(), tracks.concat()].concat())
+        };
+        let mdat_body = ftyp.len() + moov(0, 0).len() + xmp.len() + prvw_box.len() + 8;
+        let (raw_off, full_off) = (mdat_body as u64, mdat_body as u64 + 64);
+        let mdat = bx(b"mdat", &[&[0x42u8; 64][..], full].concat()); // 64 bytes of "raw data", then the JPEG
+        [ftyp, moov(raw_off, full_off), xmp, prvw_box, mdat].concat()
+    }
+
+    fn read_bytes(name: &str, bytes: &[u8], pick: Pick) -> Option<RawMeta> {
+        let path = std::env::temp_dir().join(format!("slopshot-test-{}-{name}.CR3", std::process::id()));
+        std::fs::write(&path, bytes).unwrap();
+        let m = crate::raw::read(&path, pick);
+        let _ = std::fs::remove_file(&path);
+        m
+    }
+
+    #[test]
+    fn reads_a_whole_cr3() {
+        let (prvw, full) = (jpeg(1620, 1080), jpeg(3000, 2000));
+        for tagged in [true, false] {
+            let file = fake_cr3(&prvw, &full, tagged);
+            let m = read_bytes(&format!("whole-{tagged}"), &file, Pick::Preview).unwrap();
+            assert_eq!(m.preview.as_deref(), Some(&prvw[..]), "browsing uses PRVW");
+            assert_eq!((m.exif.width, m.exif.height, m.orientation), (3000, 2000, 6));
+            assert_eq!(m.exif.camera().as_deref(), Some("Canon EOS RP"));
+            assert_eq!((m.exif.rating, m.exif.full_jpeg), (Some(3), true));
+            let m = read_bytes(&format!("full-{tagged}"), &file, Pick::FullSize).unwrap();
+            assert_eq!(m.preview.as_deref(), Some(&full[..]), "zoom uses the full-size track (tagged: {tagged})");
+        }
+    }
+
+    /// From the review: a moov with a 64-bit size near u64::MAX used to overflow
+    /// `off + size` (a panic with debug overflow checks, i.e. in `cargo test`).
+    #[test]
+    fn cursed_box_size_is_rejected_not_a_panic() {
+        let mut file = bx(b"ftyp", b"crx \0\0\0\x01crx isom");
+        file.extend(1u32.to_be_bytes());
+        file.extend(b"moov");
+        file.extend(0xFFFF_FFFF_FFFF_FFF0u64.to_be_bytes());
+        file.resize(120, 0);
+        for pick in [Pick::Preview, Pick::FullSize] {
+            assert!(read_bytes("cursed", &file, pick).is_none());
         }
     }
 }

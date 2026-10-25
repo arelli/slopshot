@@ -394,3 +394,45 @@ fn sony_makernote(t: &mut Tiff, off: u64, exif: &mut Exif) -> Option<()> {
     }
     Some(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Not a real test: a debug dump of what's read from a folder of RAWs (any
+    /// format). Ignored so it doesn't pose as a passing test; run it with
+    /// `SLOPSHOT_SAMPLES=~/Pictures/shoot cargo test --release samples -- --ignored --nocapture`
+    #[test]
+    #[ignore = "debug dump; needs SLOPSHOT_SAMPLES"]
+    fn samples() {
+        let dir = std::env::var_os("SLOPSHOT_SAMPLES").expect("set SLOPSHOT_SAMPLES to a folder of RAWs");
+        let mut paths: Vec<_> = std::fs::read_dir(dir).unwrap().flatten().map(|e| e.path()).collect();
+        paths.sort();
+        for p in paths.iter().filter(|p| p.is_file()) {
+            for pick in [Pick::Preview, Pick::FullSize] {
+                let Some(m) = read(p, pick) else {
+                    println!("{}: not readable", p.display());
+                    break;
+                };
+                let e = &m.exif;
+                let dims = m.preview.as_deref().and_then(|j| image::load_from_memory(j).ok()).map(|i| (i.width(), i.height()));
+                println!(
+                    "{} {}: jpeg {:?} bytes, decoded {:?} | {:?} {:?} | {} | {}x{} orient {} full_jpeg {} rating {:?} focus {:?}",
+                    p.file_name().unwrap().to_string_lossy(),
+                    if pick == Pick::Preview { "preview" } else { "full" },
+                    m.preview.as_ref().map(Vec::len),
+                    dims,
+                    m.date,
+                    e.camera(),
+                    e.summary(),
+                    e.width,
+                    e.height,
+                    m.orientation,
+                    e.full_jpeg,
+                    e.rating,
+                    e.focus.map(|f| (f.sensor, f.at, f.frame)),
+                );
+            }
+        }
+    }
+}
