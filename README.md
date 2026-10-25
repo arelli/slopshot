@@ -85,7 +85,7 @@ Despite all of the above, it actually does stuff:
 - Thumbnails decode in the background on half your cores at low priority, so your machine stays usable
 - Neighbouring photos are pre-decoded, so arrow-keying through the large view is instant
 - On a6700-class bodies and CR3s the full-res JPEG is fetched once you pause on a photo, so zooming feels instant
-- Parsing is a hand-rolled TIFF/EXIF/MakerNote (and CR3 box) reader that needs ~2 reads per file. Nice on slow USB drives.
+- Parsing is a hand-rolled TIFF/EXIF/MakerNote reader that needs ~2 reads per ARW (3–4 per CR3, which hides its metadata a box or two deeper). Nice on slow USB drives. An earlier version of this README said "~2 reads per file" for CR3 too. A reviewer counted. The AI has been informed.
 
 ---
 
@@ -121,7 +121,7 @@ cargo build --release
 ./target/release/slopshot ~/Pictures/shoot    # or open a folder directly
 ```
 
-On Linux the folder picker goes through the XDG desktop portal (`xdg-desktop-portal` plus a backend for your desktop). Windows and macOS *should* work since every dependency is cross-platform. That has never been tested. See disclaimer. 🙃
+On Linux the folder picker goes through the XDG desktop portal (`xdg-desktop-portal` plus a backend for your desktop). Windows works: a contributor ran it on Windows 11, so for once the README was *underselling* itself. macOS *should* work since every dependency is cross-platform. That has never been tested. See disclaimer. 🙃
 
 The first build takes a while because `rawler` is chunky. Go make coffee. ☕
 
@@ -131,15 +131,18 @@ The first build takes a while because `rawler` is chunky. Go make coffee. ☕
 
 - Sony **a6400** (RAW+JPEG, landscape night shots)
 - Sony **a6700** (RAW only, portrait cosplay shots)
-- Canon **EOS RP** (CR3, EF 24-105, beach shots in Chania). CR3 support was contributed by a *different* AI, prompted by a *different* human. The slop is now multi-vendor. 🤖🤝🤖
 - Linux (Wayland, Hyprland)
+
+Contributor-tested (the maintainer has never touched one):
+
+- Canon **EOS RP** (CR3, EF 24-105, beach shots in Chania, Windows 11). CR3 support was contributed by a *different* AI, prompted by a *different* human, and reviewed by yet another AI. The slop is now multi-vendor. 🤖🤝🤖
 
 Other Sony bodies will probably work, since they share the ARW format. Other CR3 bodies (EOS R/M/90D and newer) share one layout too, so they *should* work. "Should" is doing a lot of heavy lifting there. NEF/RAF/CR2 aren't opened at all. If you want those, you know what to do (prompt it yourself 🤖).
 
 Before you blame the AI, check what slopshot actually reads from your files (preview size, EXIF, rating, focus point):
 
 ```sh
-SLOPSHOT_SAMPLES=~/Pictures/shoot cargo test --release samples -- --nocapture
+SLOPSHOT_SAMPLES=~/Pictures/shoot cargo test --release samples -- --ignored --nocapture
 ```
 
 ---
