@@ -323,17 +323,21 @@ pub(crate) fn walk(t: &mut Tiff, start: u64, ifd0: bool, chain: bool, st: &mut W
     }
 }
 
-/// Choose among embedded JPEGs, given as (offset, length, width), and read it.
-/// Also records whether a full-resolution one exists.
-pub(crate) fn pick_jpeg(t: &mut Tiff, mut jpegs: Vec<(u64, u64, u32)>, pick: Pick, exif: &mut Exif) -> Option<Vec<u8>> {
-    jpegs.retain(|&(_, len, _)| len < 64 << 20);
+/// Embedded JPEGs claiming to be bigger than this are a corrupt length, not a JPEG.
+pub(crate) const MAX_JPEG: u64 = 64 << 20;
+
+/// Choose among embedded JPEGs, given as (offset, length, width) and already
+/// filtered to MAX_JPEG: the screen-sized preview or the full-resolution one.
+/// Returns the chosen (offset, length), and whether a full-resolution JPEG
+/// exists at all (for `Exif::full_jpeg`).
+pub(crate) fn pick_jpeg(mut jpegs: Vec<(u64, u64, u32)>, pick: Pick) -> (Option<(u64, u64)>, bool) {
     jpegs.sort_by_key(|&(_, _, w)| w);
-    exif.full_jpeg = jpegs.last().is_some_and(|j| j.2 >= 3000);
+    let full = jpegs.last().is_some_and(|j| j.2 >= 3000);
     let chosen = match pick {
         Pick::Preview => jpegs.iter().find(|j| j.2 >= 1200).or(jpegs.last()),
         Pick::FullSize => jpegs.last().filter(|j| j.2 >= 3000),
     };
-    chosen.and_then(|&(off, len, _)| t.bytes(off, len as usize))
+    (chosen.map(|&(off, len, _)| (off, len)), full)
 }
 
 pub fn read(path: &Path, pick: Pick) -> Option<RawMeta> {
@@ -353,10 +357,12 @@ pub fn read(path: &Path, pick: Pick) -> Option<RawMeta> {
     }
     let jpegs: Vec<(u64, u64, u32)> = std::mem::take(&mut st.previews)
         .into_iter()
-        .filter(|&(_, len)| len < 64 << 20)
+        .filter(|&(_, len)| len < MAX_JPEG)
         .filter_map(|(off, len)| Some((off, len, t.jpeg_dims(off)?.0)))
         .collect();
-    let preview = pick_jpeg(&mut t, jpegs, pick, &mut st.exif);
+    let (chosen, full) = pick_jpeg(jpegs, pick);
+    st.exif.full_jpeg = full;
+    let preview = chosen.and_then(|(off, len)| t.bytes(off, len as usize));
     Some(st.finish(preview))
 }
 

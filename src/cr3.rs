@@ -8,7 +8,7 @@
 //! Like the ARW path, this never touches the raw data: the boxes before `mdat`
 //! come in with the initial read, and only the chosen JPEG is read after that.
 
-use crate::raw::{Exif, Focus, Pick, RawMeta, Tiff, Walk, pick_jpeg, walk};
+use crate::raw::{Exif, Focus, MAX_JPEG, Pick, RawMeta, Tiff, Walk, pick_jpeg, walk};
 
 const CANON_UUID: [u8; 16] = *b"\x85\xc0\xb6\x87\x82\x0f\x11\xe0\x81\x11\xf4\xce\x46\x2b\x6a\x48";
 const XMP_UUID: [u8; 16] = *b"\xbe\x7a\xcf\xcb\x97\xa9\x42\xe8\x9c\x71\x99\x94\x91\xe3\xaf\xac";
@@ -173,8 +173,10 @@ pub(crate) fn read(t: &mut Tiff, pick: Pick) -> Option<RawMeta> {
     let xmp_rating = xmp.filter(|x| x.1 <= MAX_BOX).and_then(|(off, len)| rating(&t.bytes(off, len as usize)?));
     e.rating = xmp_rating.or(st.rating.filter(|r| (1..=5).contains(r)).map(|r| r as u8));
 
-    let jpegs = jpegs.into_iter().map(|(off, len, w, _)| (off, len, w)).collect();
-    let preview = pick_jpeg(t, jpegs, pick, &mut st.exif);
+    let jpegs = jpegs.into_iter().filter(|j| j.1 < MAX_JPEG).map(|(off, len, w, _)| (off, len, w)).collect();
+    let (chosen, full) = pick_jpeg(jpegs, pick);
+    st.exif.full_jpeg = full;
+    let preview = chosen.and_then(|(off, len)| t.bytes(off, len as usize));
     Some(st.finish(preview))
 }
 
