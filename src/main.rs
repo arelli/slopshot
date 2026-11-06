@@ -8,9 +8,9 @@ use eframe::egui::{
     TextureHandle, TextureOptions, UiBuilder, Vec2,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 
 const SIDECAR: &str = ".slopshot.json";
@@ -25,6 +25,7 @@ const GAP: f32 = 8.0;
 const GREEN: Color32 = Color32::from_rgb(70, 190, 90);
 const RED: Color32 = Color32::from_rgb(220, 70, 60);
 const GOLD: Color32 = Color32::from_rgb(240, 190, 40);
+const ICON_PNG: &[u8] = include_bytes!("../assets/icon.png");
 /// Film strip under the large view: total height, sprocket band height (top and
 /// bottom), photos shown each side of the current one.
 const STRIP_H: f32 = 92.0;
@@ -35,7 +36,10 @@ fn main() -> eframe::Result {
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1300.0, 850.0])
-            .with_title("slopshot"),
+            .with_title("slopshot")
+            // Lets Wayland compositors match the window to slopshot.desktop.
+            .with_app_id("slopshot")
+            .with_icon(eframe::icon_data::from_png_bytes(ICON_PNG).expect("embedded icon is a valid PNG")),
         ..Default::default()
     };
     eframe::run_native("slopshot", opts, Box::new(|cc| Ok(Box::new(App::new(&cc.egui_ctx)))))
@@ -51,7 +55,7 @@ enum Flag {
     Rejected,
 }
 
-#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default, Debug)]
 struct Mark {
     rating: u8,
     flag: Flag,
@@ -103,6 +107,9 @@ enum Thumb {
 struct Photo {
     path: PathBuf,
     name: String,
+    /// Path relative to the opened folder, `/`-separated; the photo's key in the sidecar.
+    /// Same as `name` unless it came from a subfolder.
+    rel: String,
     date: String,
     mark: Mark,
     thumb: Thumb,
@@ -135,6 +142,166 @@ fn is_raw(p: &Path) -> bool {
     p.extension()
         .and_then(|e| e.to_str())
         .is_some_and(|e| ["arw", "awr", "cr3"].iter().any(|x| e.eq_ignore_ascii_case(x)))
+}
+
+// ---------- opening a folder ----------
+//
+// Marks live in one sidecar in the opened folder, keyed by path relative to it, so a
+// plain folder's file is a map of file names and a recursive open's points into the
+// subfolders. Recursive ones are tagged, because a tree whose only marks are on
+// top-level photos would otherwise look like a plain folder.
+
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+enum Sidecar {
+    Tree { recursive: bool, marks: BTreeMap<String, Mark> },
+    Flat(BTreeMap<String, Mark>),
+}
+
+/// The marks stored in `dir`, and whether they were written by a recursive open.
+fn read_sidecar(dir: &Path) -> Option<(BTreeMap<String, Mark>, bool)> {
+    let text = std::fs::read_to_string(dir.join(SIDECAR))
+        .or_else(|_| std::fs::read_to_string(dir.join(LEGACY_SIDECAR)))
+        .ok()?;
+    Some(match serde_json::from_str(&text).ok()? {
+        Sidecar::Tree { recursive, marks } => (marks, recursive),
+        Sidecar::Flat(marks) => (marks, false),
+    })
+}
+
+/// Sidecar contents: the current photos' marks plus `kept`, the stored marks that
+/// belong to no loaded photo (a subfolder's, when the root was opened on its own).
+fn sidecar_json(photos: &[Photo], kept: &BTreeMap<String, Mark>, tree: bool) -> String {
+    let mut marks = kept.clone();
+    marks.extend(photos.iter().filter(|p| p.mark != Mark::default()).map(|p| (p.rel.clone(), p.mark)));
+    let file = if tree { Sidecar::Tree { recursive: true, marks } } else { Sidecar::Flat(marks) };
+    serde_json::to_string_pretty(&file).unwrap()
+}
+
+/// `path` relative to `root`, `/`-separated on every platform so sidecars travel.
+fn rel_key(root: &Path, path: &Path) -> String {
+    let rel = path.strip_prefix(root).unwrap_or(path);
+    rel.iter().map(|c| c.to_string_lossy()).collect::<Vec<_>>().join("/")
+}
+
+#[derive(Default)]
+struct Tree {
+    /// RAW files and their modification times.
+    files: Vec<(PathBuf, Option<std::time::SystemTime>)>,
+    /// Every folder read, parents before their children.
+    dirs: Vec<PathBuf>,
+    /// Subfolders that couldn't be read.
+    unreadable: usize,
+}
+
+/// Find the RAW files in `root`, and with `recursive` in everything below it. Symlinked
+/// folders are followed, once each, so a link back up the tree can't loop forever.
+fn walk(root: &Path, recursive: bool, found: &AtomicUsize, cancel: &AtomicBool) -> std::io::Result<Tree> {
+    let mut tree = Tree::default();
+    let mut seen = HashSet::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+        if !seen.insert(std::fs::canonicalize(&dir).unwrap_or_else(|_| dir.clone())) {
+            continue;
+        }
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(e) if dir == root => return Err(e),
+            Err(_) => {
+                tree.unreadable += 1;
+                continue;
+            }
+        };
+        for path in entries.flatten().map(|e| e.path()) {
+            let Ok(meta) = std::fs::metadata(&path) else { continue };
+            if meta.is_dir() {
+                if recursive {
+                    stack.push(path);
+                }
+            } else if meta.is_file() && is_raw(&path) {
+                tree.files.push((path, meta.modified().ok()));
+                found.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        tree.dirs.push(dir);
+    }
+    Ok(tree)
+}
+
+/// The marks for a tree being opened recursively for the first time: what the root has,
+/// plus what earlier one-folder sessions left in the subfolders. A parent wins over its
+/// children. Once the root has its own recursive sidecar that's the only source: a mark
+/// cleared since would otherwise come back from the subfolder on every open.
+fn import_subfolder_marks(root: &Path, dirs: &[PathBuf], marks: &mut BTreeMap<String, Mark>) {
+    for dir in dirs.iter().filter(|d| d.as_path() != root) {
+        let Some((sub, _)) = read_sidecar(dir) else { continue };
+        let prefix = rel_key(root, dir);
+        for (name, mark) in sub {
+            marks.entry(format!("{prefix}/{name}")).or_insert(mark);
+        }
+    }
+}
+
+/// A folder read and ready to show.
+struct Listing {
+    root: PathBuf,
+    recursive: bool,
+    photos: Vec<Photo>,
+    kept_marks: BTreeMap<String, Mark>,
+    tree_sidecar: bool,
+    unreadable: usize,
+}
+
+fn scan(root: PathBuf, recursive: bool, found: &AtomicUsize, cancel: &AtomicBool) -> Result<Listing, String> {
+    let tree = walk(&root, recursive, found, cancel).map_err(|e| format!("Can't open {}: {e}", root.display()))?;
+    let (mut marks, has_tree_sidecar) = read_sidecar(&root).unwrap_or_default();
+    if recursive && !has_tree_sidecar {
+        import_subfolder_marks(&root, &tree.dirs, &mut marks);
+    }
+    let mut photos: Vec<Photo> = tree
+        .files
+        .into_iter()
+        .map(|(path, modified)| {
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            let rel = rel_key(&root, &path);
+            let date = modified
+                .map(|t| chrono::DateTime::<chrono::Local>::from(t).format("%Y-%m-%d %H:%M:%S").to_string())
+                .unwrap_or_default();
+            let mark = marks.remove(&rel).unwrap_or_default();
+            Photo {
+                path,
+                name,
+                rel,
+                date,
+                mark,
+                thumb: Thumb::Pending,
+                auto_ev: 0.0,
+                exif: raw::Exif::default(),
+                orientation: 1,
+                sibling_jpg: false,
+            }
+        })
+        .collect();
+    photos.sort_by(|a, b| a.rel.cmp(&b.rel));
+    Ok(Listing {
+        tree_sidecar: recursive || has_tree_sidecar,
+        root,
+        recursive,
+        photos,
+        kept_marks: marks,
+        unreadable: tree.unreadable,
+    })
+}
+
+/// A folder being read in the background (a big tree on a slow drive takes a while).
+struct Scan {
+    dir: PathBuf,
+    found: Arc<AtomicUsize>,
+    cancel: Arc<AtomicBool>,
+    result: mpsc::Receiver<Result<Listing, String>>,
 }
 
 // ---------- background decoding ----------
@@ -327,14 +494,18 @@ struct Export {
     result: mpsc::Receiver<String>,
 }
 
-fn run_export(files: Vec<PathBuf>, dest: PathBuf, done: Arc<AtomicUsize>, ctx: egui::Context) -> String {
+/// Copy `files` (source, path relative to the opened folder) into `dest`. Subfolders are
+/// recreated, since cameras reuse file names across folders and flattening a recursive
+/// open would skip all but the first DSC00001.ARW as "already present".
+fn run_export(files: Vec<(PathBuf, String)>, dest: PathBuf, done: Arc<AtomicUsize>, ctx: egui::Context) -> String {
     let (mut copied, mut skipped, mut errors) = (0, 0, Vec::new());
-    for src in &files {
-        let target = dest.join(src.file_name().unwrap());
+    for (src, rel) in &files {
+        let target = dest.join(rel);
         if target.exists() {
             skipped += 1;
         } else {
-            match std::fs::copy(src, &target) {
+            let copy = target.parent().map_or(Ok(()), std::fs::create_dir_all).and_then(|_| std::fs::copy(src, &target));
+            match copy {
                 Ok(_) => copied += 1,
                 Err(e) => errors.push(format!("{}: {e}", src.display())),
             }
@@ -393,6 +564,15 @@ enum Action {
 
 struct App {
     folder: Option<PathBuf>,
+    /// The folder was opened with everything below it.
+    recursive: bool,
+    /// The sidecar is the recursive kind, and stays so even if opened as a single folder.
+    tree_sidecar: bool,
+    /// Stored marks with no photo loaded, written back on save rather than lost.
+    kept_marks: BTreeMap<String, Mark>,
+    scan: Option<Scan>,
+    /// Folder with a recursive sidecar, opened normally: waiting on the user's answer.
+    ask_recursive: Option<PathBuf>,
     photos: Vec<Photo>,
     epoch: u64,
     thumbs: Arc<Queue>,
@@ -452,6 +632,11 @@ impl App {
         let done_rx = spawn_workers(ctx, &thumbs, &fulls);
         let mut app = Self {
             folder: None,
+            recursive: false,
+            tree_sidecar: false,
+            kept_marks: BTreeMap::new(),
+            scan: None,
+            ask_recursive: None,
             photos: Vec::new(),
             epoch: 0,
             thumbs,
@@ -491,51 +676,49 @@ impl App {
             scroll_to_selected: false,
         };
         if let Some(dir) = std::env::args_os().nth(1) {
-            app.open_folder(PathBuf::from(dir));
+            app.open_folder(ctx, PathBuf::from(dir), false);
         }
         app
     }
 
-    fn open_folder(&mut self, dir: PathBuf) {
-        let entries = match std::fs::read_dir(&dir) {
-            Ok(e) => e,
-            Err(e) => {
-                self.status = format!("Can't open {}: {e}", dir.display());
-                return;
-            }
-        };
-        let marks: HashMap<String, Mark> = std::fs::read_to_string(dir.join(SIDECAR))
-            .or_else(|_| std::fs::read_to_string(dir.join(LEGACY_SIDECAR)))
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default();
+    /// Ask for a folder and open it.
+    fn pick_folder(&mut self, ctx: &egui::Context, recursive: bool) {
+        let title = if recursive { "Open folder and its subfolders" } else { "Open folder with RAW files" };
+        if let Some(dir) = rfd::FileDialog::new().set_title(title).pick_folder() {
+            self.open_folder(ctx, dir, recursive);
+        }
+    }
 
-        let mut photos: Vec<Photo> = entries
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| p.is_file() && is_raw(p))
-            .map(|path| {
-                let name = path.file_name().unwrap().to_string_lossy().into_owned();
-                let date = std::fs::metadata(&path)
-                    .and_then(|m| m.modified())
-                    .map(|t| chrono::DateTime::<chrono::Local>::from(t).format("%Y-%m-%d %H:%M:%S").to_string())
-                    .unwrap_or_default();
-                let mark = marks.get(&name).copied().unwrap_or_default();
-                Photo {
-                    path,
-                    name,
-                    date,
-                    mark,
-                    thumb: Thumb::Pending,
-                    auto_ev: 0.0,
-                    exif: raw::Exif::default(),
-                    orientation: 1,
-                    sibling_jpg: false,
-                }
-            })
-            .collect();
-        photos.sort_by(|a, b| a.name.cmp(&b.name));
+    /// Open `dir`. A normal open of a folder with a recursive sidecar asks first.
+    fn open_folder(&mut self, ctx: &egui::Context, dir: PathBuf, recursive: bool) {
+        if !recursive && read_sidecar(&dir).is_some_and(|(_, tree)| tree) {
+            self.ask_recursive = Some(dir);
+        } else {
+            self.start_scan(ctx, dir, recursive);
+        }
+    }
 
+    fn start_scan(&mut self, ctx: &egui::Context, dir: PathBuf, recursive: bool) {
+        self.cancel_scan();
+        let (tx, rx) = mpsc::channel();
+        let (found, cancel) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicBool::new(false)));
+        self.scan = Some(Scan { dir: dir.clone(), found: found.clone(), cancel: cancel.clone(), result: rx });
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(scan(dir, recursive, &found, &cancel));
+            ctx.request_repaint();
+        });
+    }
+
+    fn cancel_scan(&mut self) {
+        if let Some(s) = self.scan.take() {
+            s.cancel.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Switch to a folder that has finished scanning.
+    fn show_listing(&mut self, l: Listing) {
+        let Listing { root: dir, recursive, photos, kept_marks, tree_sidecar, unreadable } = l;
         self.epoch += 1;
         for q in [&self.thumbs, &self.fulls] {
             q.epoch.store(self.epoch, Ordering::Relaxed);
@@ -546,8 +729,18 @@ impl App {
         }
 
         self.status = format!("Loaded {} RAW file(s) from {}", photos.len(), dir.display());
+        if recursive {
+            self.status += " and its subfolders";
+        }
+        if unreadable > 0 {
+            self.status += &format!(" ({unreadable} subfolder(s) couldn't be read)");
+        }
         self.photos = photos;
         self.folder = Some(dir);
+        self.recursive = recursive;
+        self.tree_sidecar = tree_sidecar;
+        self.kept_marks = kept_marks;
+        self.anchor = None;
         self.selected = (!self.photos.is_empty()).then_some(0);
         self.viewing = false;
         self.full.clear();
@@ -595,13 +788,7 @@ impl App {
 
     fn save_marks(&mut self) {
         let Some(dir) = &self.folder else { return };
-        let marks: HashMap<&str, Mark> = self
-            .photos
-            .iter()
-            .filter(|p| p.mark != Mark::default())
-            .map(|p| (p.name.as_str(), p.mark))
-            .collect();
-        let json = serde_json::to_string_pretty(&marks).unwrap();
+        let json = sidecar_json(&self.photos, &self.kept_marks, self.tree_sidecar);
         if let Err(e) = std::fs::write(dir.join(SIDECAR), json) {
             self.status = format!("Couldn't save ratings: {e}");
         }
@@ -613,7 +800,7 @@ impl App {
         let mut v: Vec<usize> = (0..self.photos.len())
             .filter(|&i| {
                 let p = &self.photos[i];
-                (name.is_empty() || p.name.to_lowercase().contains(&name))
+                (name.is_empty() || p.rel.to_lowercase().contains(&name))
                     && p.mark.rating >= self.f_min_rating
                     && match self.f_flag {
                         FlagFilter::All => true,
@@ -630,9 +817,9 @@ impl App {
         v.sort_by(|&a, &b| {
             let (pa, pb) = (&self.photos[a], &self.photos[b]);
             let o = match self.sort {
-                SortBy::Name => pa.name.cmp(&pb.name),
-                SortBy::Date => pa.date.cmp(&pb.date).then(pa.name.cmp(&pb.name)),
-                SortBy::Rating => pa.mark.rating.cmp(&pb.mark.rating).then(pa.name.cmp(&pb.name)),
+                SortBy::Name => pa.rel.cmp(&pb.rel),
+                SortBy::Date => pa.date.cmp(&pb.date).then(pa.rel.cmp(&pb.rel)),
+                SortBy::Rating => pa.mark.rating.cmp(&pb.mark.rating).then(pa.rel.cmp(&pb.rel)),
             };
             if self.sort_desc { o.reverse() } else { o }
         });
@@ -663,7 +850,7 @@ impl App {
     }
 
     fn handle_keys(&mut self, ctx: &egui::Context, vis: &[usize]) {
-        if ctx.wants_keyboard_input() {
+        if ctx.wants_keyboard_input() || self.ask_recursive.is_some() {
             return;
         }
         let at = self.selected.and_then(|s| locate(vis, s, self.anchor));
@@ -711,11 +898,11 @@ impl App {
     }
 
     fn start_export(&mut self, ctx: &egui::Context) {
-        let files: Vec<PathBuf> = self
+        let files: Vec<(PathBuf, String)> = self
             .photos
             .iter()
             .filter(|p| p.mark.flag == Flag::Picked)
-            .map(|p| p.path.clone())
+            .map(|p| (p.path.clone(), p.rel.clone()))
             .collect();
         if files.is_empty() {
             self.status = "Nothing is picked yet — press P on a photo to pick it.".into();
@@ -728,6 +915,11 @@ impl App {
             self.status = "Destination is the source folder — pick a different one.".into();
             return;
         }
+        // The copies would turn up as extra photos the next time the tree is opened.
+        if self.recursive && self.folder.as_ref().is_some_and(|f| dest.starts_with(f)) {
+            self.status = "Destination is inside the opened folder tree — pick one outside it.".into();
+            return;
+        }
         let (tx, rx) = mpsc::channel();
         let done = Arc::new(AtomicUsize::new(0));
         self.export = Some(Export { total: files.len(), done: done.clone(), result: rx });
@@ -738,6 +930,23 @@ impl App {
     }
 
     fn receive(&mut self, ctx: &egui::Context) {
+        if let Some(s) = &self.scan {
+            match s.result.try_recv() {
+                Ok(Ok(listing)) => {
+                    self.scan = None;
+                    self.show_listing(listing);
+                }
+                Ok(Err(e)) => {
+                    self.scan = None;
+                    self.status = e;
+                }
+                Err(mpsc::TryRecvError::Empty) => ctx.request_repaint_after(std::time::Duration::from_millis(100)),
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.status = format!("Couldn't read {}", s.dir.display());
+                    self.scan = None;
+                }
+            }
+        }
         while let Ok(d) = self.done_rx.try_recv() {
             match d {
                 Done::Thumb { epoch, idx, img, meta, auto_ev, sibling } if epoch == self.epoch => {
@@ -778,7 +987,7 @@ impl App {
                         Some(_) => {}
                         None => {
                             self.hires_failed.insert(idx);
-                            self.status = format!("Couldn't load full resolution for {}", self.photos[idx].name);
+                            self.status = format!("Couldn't load full resolution for {}", self.photos[idx].rel);
                         }
                     }
                 }
@@ -807,12 +1016,28 @@ impl App {
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                if ui.button("📂 Open folder…").clicked() {
-                    if let Some(dir) = rfd::FileDialog::new().set_title("Open folder with RAW files").pick_folder() {
-                        self.open_folder(dir);
+                let mut open = None;
+                ui.menu_button("File", |ui| {
+                    if ui.button("📂 Open folder…").clicked() {
+                        open = Some(false);
                     }
+                    if ui.button("📂 Open folder recursively…").on_hover_text("Include every subfolder").clicked() {
+                        open = Some(true);
+                    }
+                });
+                if let Some(recursive) = open {
+                    self.pick_folder(ctx, recursive);
                 }
                 ui.separator();
+                if let Some(s) = &self.scan {
+                    ui.spinner();
+                    ui.label(format!("Scanning… {} RAW file(s) found", s.found.load(Ordering::Relaxed)))
+                        .on_hover_text(s.dir.display().to_string());
+                    if ui.button("Cancel").clicked() {
+                        self.cancel_scan();
+                    }
+                    ui.separator();
+                }
                 ui.label("☀");
                 ui.add(egui::Slider::new(&mut self.ev, -2.0..=3.0).step_by(0.1).suffix(" EV"))
                     .on_hover_text("Display brightness only — files are never changed");
@@ -839,8 +1064,8 @@ impl App {
                     }
                     // Path last, so it truncates into whatever space the buttons leave.
                     if let Some(f) = &self.folder {
-                        ui.add(egui::Label::new(RichText::new(f.display().to_string()).weak()).truncate())
-                            .on_hover_text(f.display().to_string());
+                        let path = if self.recursive { format!("{} + subfolders", f.display()) } else { f.display().to_string() };
+                        ui.add(egui::Label::new(RichText::new(&path).weak()).truncate()).on_hover_text(path);
                     }
                 });
             });
@@ -848,10 +1073,21 @@ impl App {
         });
     }
 
-    fn bottom_bar(&self, ctx: &egui::Context, shown: usize) {
+    fn bottom_bar(&self, ctx: &egui::Context, vis: &[usize]) {
         egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 let count = |f| self.photos.iter().filter(|p| p.mark.flag == f).count();
+                let at = self.selected.and_then(|s| locate(vis, s, self.anchor));
+                if let Some((seen, left)) = list_progress(vis.len(), at) {
+                    ui.add(
+                        egui::ProgressBar::new(seen as f32 / vis.len() as f32)
+                            .desired_width(200.0)
+                            .text(format!("{seen} / {} · {left} left", vis.len())),
+                    )
+                    .on_hover_text("Position of the current photo in the list, and how many come after it");
+                    ui.separator();
+                }
+                let shown = vis.len();
                 ui.label(format!(
                     "{} photos · {shown} shown · {} picked · {} rejected",
                     self.photos.len(),
@@ -1026,6 +1262,7 @@ impl App {
             _ => (Vec::new(), 0.0),
         };
         let gone = matches!(locate(vis, idx, self.anchor), Some(At::Gone(_)));
+        let (prev, next) = neighbours(vis, locate(vis, idx, self.anchor));
         for &i in strip.0.iter().flatten() {
             let ev = self.display_ev(i);
             if let Thumb::Ready(s) = &mut self.photos[i].thumb {
@@ -1039,7 +1276,7 @@ impl App {
         ui.horizontal_wrapped(|ui| {
             back = ui.button("⬅ Grid (Esc)").clicked();
             ui.separator();
-            ui.label(RichText::new(&p.name).strong());
+            ui.label(RichText::new(&p.rel).strong());
             ui.label(RichText::new(&p.date).weak());
             ui.separator();
             ui.horizontal(|ui| mark_controls(ui, p, idx, 20.0, &mut actions));
@@ -1087,6 +1324,7 @@ impl App {
         }
         let Some(layout_tex) = preview.or(hires_tex) else {
             ui.put(rect, egui::Spinner::new().size(32.0));
+            nav_arrows(ui, rect, prev, next, &mut actions);
             return actions;
         };
 
@@ -1159,6 +1397,7 @@ impl App {
             painter.rect_stroke(r, 2.0, Stroke::new(3.0, Color32::from_black_alpha(140)), egui::StrokeKind::Outside);
             painter.rect_stroke(r, 2.0, Stroke::new(1.5, GREEN), egui::StrokeKind::Outside);
         }
+        nav_arrows(ui, rect, prev, next, &mut actions);
 
         if self.zoom > 1.0 {
             if resp.dragged() {
@@ -1184,6 +1423,40 @@ impl App {
         actions
     }
 
+    /// Asked when a folder with a recursive sidecar is opened normally.
+    fn recursive_prompt(&mut self, ctx: &egui::Context) {
+        let Some(dir) = self.ask_recursive.clone() else { return };
+        let mut answer = None;
+        let modal = egui::Modal::new(egui::Id::new("ask_recursive")).show(ctx, |ui| {
+            ui.set_max_width(420.0);
+            ui.heading("Open subfolders too?");
+            ui.add_space(4.0);
+            ui.label(format!("{} has been opened recursively before.", dir.display()));
+            ui.label("Its ratings and flags cover the photos in its subfolders as well.");
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui.button("Open recursively").clicked() {
+                    answer = Some(Some(true));
+                }
+                if ui.button("Just this folder").clicked() {
+                    answer = Some(Some(false));
+                }
+                if ui.button("Cancel").clicked() {
+                    answer = Some(None);
+                }
+            });
+        });
+        if modal.should_close() {
+            answer = answer.or(Some(None));
+        }
+        if let Some(choice) = answer {
+            self.ask_recursive = None;
+            if let Some(recursive) = choice {
+                self.start_scan(ctx, dir, recursive);
+            }
+        }
+    }
+
     fn info_panel(&self, ctx: &egui::Context, idx: usize) {
         let p = &self.photos[idx];
         let e = &p.exif;
@@ -1199,7 +1472,7 @@ impl App {
             let res = p.native_size().map(|s| format!("{} × {} ({:.1} MP)", s.x, s.y, s.x * s.y / 1e6));
             let file_size = std::fs::metadata(&p.path).ok().map(|m| format!("{:.1} MB", m.len() as f64 / 1e6));
             let rows = [
-                ("File", Some(p.name.clone())),
+                ("File", Some(p.rel.clone())),
                 ("Date", Some(p.date.clone())),
                 ("Camera", e.camera()),
                 ("Lens", e.lens.clone()),
@@ -1291,6 +1564,54 @@ fn step_from(at: Option<At>, step: isize, len: usize) -> usize {
     new.clamp(0, len as isize - 1) as usize
 }
 
+/// How far through a list of `len` photos the current one is: photos up to and including
+/// it, and photos after it. One that just left the filter is no longer counted itself,
+/// and the photos after it are still to come. `None` with nothing to show.
+fn list_progress(len: usize, at: Option<At>) -> Option<(usize, usize)> {
+    match at? {
+        _ if len == 0 => None,
+        At::In(p) => Some((p + 1, len - p - 1)),
+        At::Gone(p) => Some((p, len - p)),
+    }
+}
+
+/// The photos the on-screen arrows lead to, `None` past either end of `vis`. Agrees
+/// with `step_from`, so the arrows and the arrow keys never disagree.
+fn neighbours(vis: &[usize], at: Option<At>) -> (Option<usize>, Option<usize>) {
+    let (prev, next) = match at {
+        Some(At::In(p)) => (p.checked_sub(1), Some(p + 1)),
+        Some(At::Gone(p)) => (p.checked_sub(1), Some(p)),
+        None => (None, Some(0)),
+    };
+    (prev.and_then(|p| vis.get(p).copied()), next.and_then(|n| vis.get(n).copied()))
+}
+
+/// Previous/next buttons over the edges of the large view. Call after painting the
+/// photo: they need to be above it, both on screen and for the mouse.
+fn nav_arrows(ui: &egui::Ui, rect: Rect, prev: Option<usize>, next: Option<usize>, actions: &mut Vec<Action>) {
+    const RADIUS: f32 = 24.0;
+    let painter = ui.painter().with_clip_rect(rect);
+    for (target, dir, tip) in [(prev, -1.0, "Previous photo (←)"), (next, 1.0, "Next photo (→)")] {
+        let Some(target) = target else { continue };
+        let inset = RADIUS + 8.0;
+        let x = if dir < 0.0 { rect.left() + inset } else { rect.right() - inset };
+        let c = pos2(x, rect.center().y);
+        let hit = Rect::from_center_size(c, Vec2::splat(RADIUS * 2.0));
+        let resp = ui
+            .interact(hit, ui.id().with(("nav", tip)), Sense::click())
+            .on_hover_text(tip)
+            .on_hover_cursor(egui::CursorIcon::PointingHand);
+        let (bg, fg) = if resp.hovered() { (190, 255) } else { (90, 190) };
+        painter.circle_filled(c, RADIUS, Color32::from_black_alpha(bg));
+        let (w, h) = (6.0 * dir, 11.0);
+        let chevron = vec![c + vec2(-w, -h), c + vec2(w, 0.0), c + vec2(-w, h)];
+        painter.line(chevron, Stroke::new(3.0, Color32::from_white_alpha(fg)));
+        if resp.clicked() {
+            actions.push(Action::Jump(target));
+        }
+    }
+}
+
 /// Slots for the film strip: the current photo in the middle and `n` neighbours
 /// per side in `vis` order (`None` past either end, so the current photo stays
 /// centred), plus the frame width. A photo that has just been filtered out keeps
@@ -1350,7 +1671,7 @@ fn film_strip(ui: &egui::Ui, photos: &[Photo], strip: &Strip, rect: Rect, action
         painter.rect_filled(frame, 2.0, Color32::from_gray(26));
         let Some(i) = *slot else { continue };
         let p = &photos[i];
-        let resp = ui.interact(frame, ui.id().with(("strip", k)), Sense::click()).on_hover_text(&p.name);
+        let resp = ui.interact(frame, ui.id().with(("strip", k)), Sense::click()).on_hover_text(&p.rel);
         let pic = match &p.thumb {
             // Greyed out right down when it has just dropped out of the filter.
             Thumb::Ready(s) => paint_fit(ui, &s.tex, frame.shrink(2.0), if i == current && gone { Color32::from_gray(60) } else { dim(p) }),
@@ -1430,7 +1751,15 @@ fn card(ui: &mut egui::Ui, p: &Photo, idx: usize, selected: bool, show_focus: bo
     }
 
     ui.horizontal(|ui| {
-        ui.add(egui::Label::new(RichText::new(&p.name).strong()).truncate());
+        // The folder goes after the name, so it's what gets cut short: DSC00001 repeats
+        // across a tree, and the file name is what you came to read.
+        match p.rel.rsplit_once('/') {
+            Some((folder, _)) => {
+                ui.label(RichText::new(&p.name).strong());
+                ui.add(egui::Label::new(RichText::new(folder).small().weak()).truncate());
+            }
+            None => _ = ui.add(egui::Label::new(RichText::new(&p.name).strong()).truncate()),
+        }
     });
     ui.label(RichText::new(&p.date).small().weak());
     ui.label(RichText::new(p.exif.summary()).small().weak());
@@ -1458,8 +1787,9 @@ impl eframe::App for App {
             self.viewer_at = None;
         }
 
+        self.recursive_prompt(ctx);
         self.top_bar(ctx);
-        self.bottom_bar(ctx, vis.len());
+        self.bottom_bar(ctx, &vis);
         self.filter_panel(ctx);
         if let (true, Some(idx)) = (self.show_info && !self.photos.is_empty(), self.selected) {
             self.info_panel(ctx, idx);
@@ -1467,17 +1797,29 @@ impl eframe::App for App {
 
         egui::CentralPanel::default().show(ctx, |ui| {
             if self.folder.is_none() {
-                ui.centered_and_justified(|ui| {
+                if self.scan.is_some() {
+                    ui.centered_and_justified(|ui| ui.add(egui::Spinner::new().size(32.0)));
+                    return;
+                }
+                let mut open = None;
+                ui.vertical_centered(|ui| {
+                    ui.add_space((ui.available_height() - 90.0).max(0.0) / 2.0);
                     if ui.button(RichText::new("📂 Open a folder of ARW/CR3 files…").size(20.0)).clicked() {
-                        if let Some(dir) = rfd::FileDialog::new().pick_folder() {
-                            self.open_folder(dir);
-                        }
+                        open = Some(false);
+                    }
+                    ui.add_space(8.0);
+                    if ui.button(RichText::new("📂 Open a folder and its subfolders…").size(20.0)).clicked() {
+                        open = Some(true);
                     }
                 });
+                if let Some(recursive) = open {
+                    self.pick_folder(ctx, recursive);
+                }
                 return;
             }
             if self.photos.is_empty() {
-                ui.centered_and_justified(|ui| ui.label("No .ARW or .CR3 files in this folder."));
+                let empty = if self.recursive { "No .ARW or .CR3 files in this folder or below it." } else { "No .ARW or .CR3 files in this folder." };
+                ui.centered_and_justified(|ui| ui.label(empty));
                 return;
             }
             let actions = match (self.viewing, self.selected) {
@@ -1494,6 +1836,12 @@ impl eframe::App for App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn embedded_icon_decodes() {
+        let icon = eframe::icon_data::from_png_bytes(ICON_PNG).unwrap();
+        assert_eq!((icon.width, icon.height), (256, 256));
+    }
 
     #[test]
     fn strip_neighbour_count() {
@@ -1537,5 +1885,201 @@ mod tests {
         // A stale anchor for some other photo doesn't apply; at the end, it clamps.
         assert_eq!(locate(&vis, 5, Some((8, 2))), None);
         assert_eq!(locate(&[0, 1], 9, Some((9, 7))), Some(At::Gone(2)));
+    }
+
+    #[test]
+    fn on_screen_arrows_match_the_arrow_keys() {
+        let vis = vec![7, 3, 9];
+        assert_eq!(neighbours(&vis, Some(At::In(0))), (None, Some(3)));
+        assert_eq!(neighbours(&vis, Some(At::In(1))), (Some(7), Some(9)));
+        assert_eq!(neighbours(&vis, Some(At::In(2))), (Some(3), None));
+        // A photo that left the filter: its old neighbours, nothing skipped.
+        assert_eq!(neighbours(&vis, Some(At::Gone(1))), (Some(7), Some(3)));
+        assert_eq!(neighbours(&vis, Some(At::Gone(3))), (Some(9), None));
+        assert_eq!(neighbours(&[], Some(At::Gone(0))), (None, None));
+        for at in [At::In(1), At::Gone(1)] {
+            let (prev, next) = neighbours(&vis, Some(at));
+            assert_eq!(prev, Some(vis[step_from(Some(at), -1, vis.len())]));
+            assert_eq!(next, Some(vis[step_from(Some(at), 1, vis.len())]));
+        }
+    }
+
+    /// A unique empty folder, removed again on drop.
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new() -> Self {
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
+            let n = NEXT.fetch_add(1, Ordering::Relaxed);
+            let dir = std::env::temp_dir().join(format!("slopshot-test-{}-{n}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+        /// Create a file (and the folders on the way to it) with some content.
+        fn file(&self, rel: &str, content: &str) {
+            let path = self.0.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, content).unwrap();
+        }
+        fn read(&self, rel: &str) -> String {
+            std::fs::read_to_string(self.0.join(rel)).unwrap()
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn open(dir: &TempDir, recursive: bool) -> Listing {
+        scan(dir.0.clone(), recursive, &AtomicUsize::new(0), &AtomicBool::new(false)).unwrap()
+    }
+
+    fn rels(l: &Listing) -> Vec<&str> {
+        l.photos.iter().map(|p| p.rel.as_str()).collect()
+    }
+
+    fn mark(l: &Listing, rel: &str) -> Mark {
+        l.photos.iter().find(|p| p.rel == rel).unwrap().mark
+    }
+
+    const PICKED: Mark = Mark { rating: 0, flag: Flag::Picked };
+
+    fn save(l: &Listing) {
+        let json = sidecar_json(&l.photos, &l.kept_marks, l.tree_sidecar);
+        std::fs::write(l.root.join(SIDECAR), json).unwrap();
+    }
+
+    #[test]
+    fn recursive_open_finds_every_level_and_plain_open_only_the_top() {
+        let d = TempDir::new();
+        for f in ["top.ARW", "a/one.cr3", "a/b/c/deep.ARW", "z/one.cr3", "a/notes.txt", "a/one.JPG"] {
+            d.file(f, "");
+        }
+        assert_eq!(rels(&open(&d, false)), ["top.ARW"]);
+        let all = open(&d, true);
+        assert_eq!(rels(&all), ["a/b/c/deep.ARW", "a/one.cr3", "top.ARW", "z/one.cr3"]);
+        assert_eq!(all.photos[1].name, "one.cr3");
+    }
+
+    #[test]
+    fn symlink_back_up_the_tree_terminates() {
+        let d = TempDir::new();
+        d.file("a/one.ARW", "");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&d.0, d.0.join("a/loop")).unwrap();
+        assert_eq!(rels(&open(&d, true)), ["a/one.ARW"]);
+    }
+
+    /// The root's sidecar points into the subfolders, and is what marks a folder as
+    /// one to ask about on a normal open.
+    #[test]
+    fn recursive_sidecar_lives_in_the_root_and_points_into_subfolders() {
+        let d = TempDir::new();
+        d.file("top.ARW", "");
+        d.file("a/b/deep.ARW", "");
+        let mut l = open(&d, true);
+        l.photos.iter_mut().find(|p| p.rel == "a/b/deep.ARW").unwrap().mark = PICKED;
+        save(&l);
+
+        let json: serde_json::Value = serde_json::from_str(&d.read(SIDECAR)).unwrap();
+        assert_eq!(json["recursive"], true);
+        assert_eq!(json["marks"]["a/b/deep.ARW"]["flag"], "Picked");
+        assert!(!d.0.join("a/b").join(SIDECAR).exists());
+        assert!(read_sidecar(&d.0).unwrap().1);
+        assert_eq!(mark(&open(&d, true), "a/b/deep.ARW"), PICKED);
+    }
+
+    #[test]
+    fn tree_sidecar_with_only_top_level_marks_is_still_recursive() {
+        let d = TempDir::new();
+        d.file("top.ARW", "");
+        d.file("a/one.ARW", "");
+        let mut l = open(&d, true);
+        l.photos[1].mark = PICKED;
+        save(&l);
+        assert!(read_sidecar(&d.0).unwrap().1);
+    }
+
+    #[test]
+    fn plain_folder_keeps_the_plain_format() {
+        let d = TempDir::new();
+        d.file("top.ARW", "");
+        let mut l = open(&d, false);
+        l.photos[0].mark = PICKED;
+        save(&l);
+        assert!(!read_sidecar(&d.0).unwrap().1);
+        let json: serde_json::Value = serde_json::from_str(&d.read(SIDECAR)).unwrap();
+        assert_eq!(json["top.ARW"]["flag"], "Picked");
+        assert_eq!(mark(&open(&d, false), "top.ARW"), PICKED);
+    }
+
+    /// Answering "Just this folder" and rating something mustn't cost the subfolders' marks.
+    #[test]
+    fn plain_open_of_a_recursive_folder_keeps_subfolder_marks() {
+        let d = TempDir::new();
+        d.file("top.ARW", "");
+        d.file("a/one.ARW", "");
+        let mut l = open(&d, true);
+        l.photos.iter_mut().for_each(|p| p.mark = PICKED);
+        save(&l);
+
+        let mut plain = open(&d, false);
+        assert_eq!(rels(&plain), ["top.ARW"]);
+        assert_eq!(mark(&plain, "top.ARW"), PICKED);
+        plain.photos[0].mark = Mark::default();
+        save(&plain);
+
+        assert!(read_sidecar(&d.0).unwrap().1);
+        let again = open(&d, true);
+        assert_eq!(mark(&again, "a/one.ARW"), PICKED);
+        assert_eq!(mark(&again, "top.ARW"), Mark::default());
+    }
+
+    #[test]
+    fn first_recursive_open_imports_subfolder_marks_once() {
+        let d = TempDir::new();
+        d.file("a/one.ARW", "");
+        d.file("a/two.ARW", "");
+        d.file("a/.slopshot.json", r#"{"one.ARW":{"rating":3,"flag":"Picked"},"two.ARW":{"rating":0,"flag":"Rejected"}}"#);
+        // Marked from the root too: the root's copy wins.
+        d.file(".slopshot.json", r#"{"a/two.ARW":{"rating":1,"flag":"None"}}"#);
+        let mut l = open(&d, true);
+        assert_eq!(mark(&l, "a/one.ARW"), Mark { rating: 3, flag: Flag::Picked });
+        assert_eq!(mark(&l, "a/two.ARW"), Mark { rating: 1, flag: Flag::None });
+
+        // Clearing an imported mark sticks, though the subfolder's file still has it.
+        l.photos[0].mark = Mark::default();
+        save(&l);
+        assert_eq!(mark(&open(&d, true), "a/one.ARW"), Mark::default());
+    }
+
+    #[test]
+    fn progress_is_the_position_in_the_list() {
+        assert_eq!(list_progress(8, Some(At::In(0))), Some((1, 7)));
+        assert_eq!(list_progress(8, Some(At::In(2))), Some((3, 5)));
+        assert_eq!(list_progress(8, Some(At::In(7))), Some((8, 0)));
+        // The current photo left the filter: 2 behind it, its 5 old followers ahead.
+        assert_eq!(list_progress(7, Some(At::Gone(2))), Some((2, 5)));
+        assert_eq!(list_progress(7, Some(At::Gone(7))), Some((7, 0)));
+        assert_eq!(list_progress(0, Some(At::Gone(0))), None);
+        assert_eq!(list_progress(8, None), None);
+    }
+
+    /// Cameras reuse names across folders; flattening would silently drop picks.
+    #[test]
+    fn export_keeps_same_named_files_from_different_folders() {
+        let (src, dest) = (TempDir::new(), TempDir::new());
+        src.file("100/DSC1.ARW", "first");
+        src.file("101/DSC1.ARW", "second");
+        src.file("top.ARW", "top");
+        let files = rels(&open(&src, true)).into_iter().map(|r| (src.0.join(r), r.to_string())).collect();
+        let done = Arc::new(AtomicUsize::new(0));
+        let msg = run_export(files, dest.0.clone(), done, egui::Context::default());
+        assert!(msg.starts_with("Exported 3 file(s)"), "{msg}");
+        assert_eq!(dest.read("100/DSC1.ARW"), "first");
+        assert_eq!(dest.read("101/DSC1.ARW"), "second");
+        assert_eq!(dest.read("top.ARW"), "top");
     }
 }

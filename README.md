@@ -58,13 +58,16 @@
 Despite all of the above, it actually does stuff:
 
 ### Culling
-- **Open a folder** of `.ARW` / `.CR3` files (native folder picker, or pass the folder as an argument)
+- **Open a folder** of `.ARW` / `.CR3` files (`File → Open folder…`, or pass the folder as an argument)
+- **Open a whole tree** with `File → Open folder recursively…`: every subfolder, however deep. The name filter matches folder names too, and sorting by name keeps each folder's photos together.
 - **Gallery grid** with thumbnails, filename, capture date and an EXIF summary (`50mm  f/2.8  1/125s  ISO 1000`)
 - **Star ratings** (1–5), **pick** ✔ and **reject** ✖ flags. Rejected shots get dimmed so they stop judging you. `P`/`X` toggle, so hitting one twice is a no-op, not a commitment.
 - **Cull with a filter on**: filter to *Unflagged*, open the large view and start pressing `P`/`X`. A photo that drops out of the filter stays on screen (greyed out in the film strip, in its old slot), and the arrows carry on to its old neighbours instead of teleporting you back to photo #1. Changed your mind? Press the key again and it's back.
+- **Progress bar** in the status bar: where the current photo sits in the list, and how many come after it (`3 / 8 · 5 left`). It follows your filter and sort.
 - **Ratings persist** in a small `.slopshot.json` file in the photo folder. Your RAWs are never modified.
+- **A recursive open keeps one file**, in the folder you opened, with paths pointing into the subfolders (`{"recursive": true, "marks": {"100MSDCF/DSC00001.ARW": {...}}}`). The first recursive open also pulls in any `.slopshot.json` already sitting in the subfolders. Open that folder normally later and slopshot asks whether you want the subfolders too. Answer "Just this folder" and the subfolders' marks are still kept in the file.
 - **In-camera ratings** are imported if you starred shots on the camera
-- **Export** copies every picked file to a folder of your choice, with a progress bar. Existing files are skipped, never overwritten.
+- **Export** copies every picked file to a folder of your choice, with a progress bar. Existing files are skipped, never overwritten. After a recursive open the subfolders are recreated in the destination, because your camera has absolutely taken more than one `DSC00001.ARW`.
 
 ### Filter & sort
 - Filter by **name**, **minimum rating**, **flag** (picked / rejected / unflagged / not rejected) and **date range**. Partial dates work (`2026-10` = all of October).
@@ -72,6 +75,7 @@ Despite all of the above, it actually does stuff:
 
 ### Viewing
 - **Large view** with **zoom** (scroll, `+`/`-`, pinch) and **pan** (drag)
+- **On-screen arrows** at the edges of the large view, for going back and forth with the mouse
 - **Full resolution when zoomed**, from the best available source:
   1. the camera JPG next to the RAW (RAW+JPEG shooters)
   2. the full-size JPEG embedded in the RAW (a6700-generation Sony bodies, every CR3)
@@ -94,7 +98,7 @@ Despite all of the above, it actually does stuff:
 
 | Key | Action |
 |---|---|
-| `←` `→` `↑` `↓` | Move selection / previous–next photo (also from a photo that just left the filter) |
+| `←` `→` `↑` `↓` | Move selection / previous–next photo (also from a photo that just left the filter). The on-screen arrows in the large view do the same. |
 | `1`–`5` | Rate · `0` clears |
 | `P` / `X` / `U` | Pick / reject / unflag · `P`/`X` again clears it |
 | `Enter` / `Space` / double-click | Open large view |
@@ -119,8 +123,16 @@ git clone https://github.com/the-rectifier/slopshot.git
 cd slopshot
 cargo build --release
 ./target/release/slopshot                     # opens with a folder picker
-./target/release/slopshot ~/Pictures/shoot    # or open a folder directly
+./target/release/slopshot ~/Pictures/shoot    # or open a folder directly (asks first if it has a recursive sidecar)
 ```
+
+To install it on Linux, with a launcher entry:
+
+```sh
+cargo install-desktop
+```
+
+That puts the binary in `~/.local/bin` and adds `applications/slopshot.desktop` and the icon (`icons/hicolor/{scalable,256x256}/apps/slopshot.*`) to `~/.local/share` (or `$XDG_DATA_HOME`). To remove it, run `cargo uninstall --root ~/.local slopshot` and delete those files.
 
 On Linux the folder picker goes through the XDG desktop portal (`xdg-desktop-portal` plus a backend for your desktop). Windows works: a contributor ran it on Windows 11, so for once the README was *underselling* itself. macOS *should* work since every dependency is cross-platform. That has never been tested. See disclaimer. 🙃
 
@@ -132,7 +144,7 @@ There are tests now, which is a sentence nobody expected to read in this README:
 cargo test
 ```
 
-They cover CR3 box walking, a whole synthetic CR3 end to end, XMP ratings, Canon AF maths, film strip layout, culling with a filter on, and one cursed file that used to crash a worker thread. They were also written by an AI. Obviously.
+They cover CR3 box walking, a whole synthetic CR3 end to end, XMP ratings, Canon AF maths, film strip layout, culling with a filter on, recursive opening and its sidecar, export name clashes, and one cursed file that used to crash a worker thread. They were also written by an AI. Obviously.
 
 ---
 
@@ -162,6 +174,8 @@ SLOPSHOT_SAMPLES=~/Pictures/shoot cargo test --release samples -- --ignored --no
 - The RAW-develop fallback has no camera tone curve, so it looks flatter than the camera JPEG. It's brightness-matched to the preview, but it isn't a raw editor.
 - Mirrored orientations (EXIF 2/4/5/7) aren't handled. Your camera almost certainly never writes them.
 - One full-res image is kept in memory at a time (~100–200 MB for 24–26 MP)
+- Marks made in a recursive open stay in the root's file. Opening a subfolder on its own doesn't see them, and once the root's file exists, marks made in a subfolder on its own aren't picked up by it.
+- "Every subfolder" means every subfolder, including hidden ones like `.Trash-1000`.
 
 ---
 

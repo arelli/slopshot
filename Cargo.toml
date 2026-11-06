@@ -1,8 +1,11 @@
 [package]
 name = "slopshot"
-version = "0.1.0"
+version = "0.69.420"
 edition = "2024"
 license = "MIT"
+
+[workspace]
+members = ["xtask"]
 
 [dependencies]
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
