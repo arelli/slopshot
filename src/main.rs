@@ -1,3 +1,7 @@
+// Release builds on Windows are a windowed app: no console opening next to the
+// window when started from a shortcut. Debug builds keep it for error output.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 mod cr3;
 mod exposure;
 mod pixels;
