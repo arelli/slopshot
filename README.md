@@ -1,6 +1,6 @@
 # slopshot 📸🤖
 
-> A tiny photo culler for Sony (`.ARW`) and Canon (`.CR3`) RAW files. Open folder, star, pick, reject, export. That's it.
+> A tiny photo culler for Sony (`.ARW`) and Canon (`.CR3`) RAW files, and the camera clips shot alongside them. Open folder, star, pick, reject, trim, export. That's it.
 
 ---
 
@@ -69,8 +69,17 @@ Despite all of the above, it actually does stuff:
 - **In-camera ratings** are imported if you starred shots on the camera
 - **Export** copies every picked file to a folder of your choice, with a progress bar. Existing files are skipped, never overwritten. After a recursive open the subfolders are recreated in the destination, because your camera has absolutely taken more than one `DSC00001.ARW`.
 
+### Video clips
+Camera clips (`.MP4`, `.MOV`, `.MTS`) show up in the same grid as the photos, with a ▶ badge and their length, and get the same stars, picks, rejects, filters and sidecar. Everything video goes through [ffmpeg](https://ffmpeg.org), which has to be installed (see [Building](#building)).
+
+- **Player** in the large view: play/pause with sound, frame stepping, ±5 s jumps, a timeline to scrub. While a seek catches up, scrubbing shows the clip's keyframes (decoded in the background at thumbnail size), so dragging along the timeline doesn't wait on the decoder.
+- **Trim**: set the start and end with `[` and `]`, the buttons, or by dragging the handles on the timeline. Only the kept part is exported.
+- **Color**: exposure, contrast, saturation, white balance (temperature/tint), and **levels** you drag right on the histogram (black point, midtones, white point), plus **Auto levels**. A second histogram shows the result. Copy a clip's look and paste it onto the next one; `\` flips back to the original. The preview and the export use the same color math: the grade is baked into a 3D LUT for ffmpeg, so the file looks like what you saw.
+- **Export** of picked clips: trim, color and compression in one pass. Encoders are picked from what your machine can actually run (Intel Quick Sync, NVIDIA NVENC, or x265/x264 on the CPU), defaulting to HEVC at 1080p on the GPU; 4K drone footage comes out at a fraction of its size. Clips are never upscaled. The capture date (moved to the trim start), GPS location and file date are kept, so photo libraries like Immich file the clip in the right place. Or skip re-encoding and just cut the clip (instant, but the cut lands on a keyframe and color isn't applied).
+- Edits live in the same `.slopshot.json`, next to the clip's rating. The original files are never touched.
+
 ### Filter & sort
-- Filter by **name**, **minimum rating**, **flag** (picked / rejected / unflagged / not rejected) and **date range**. Partial dates work (`2026-10` = all of October).
+- Filter by **type** (photos / clips), **name**, **minimum rating**, **flag** (picked / rejected / unflagged / not rejected) and **date range**. Partial dates work (`2026-10` = all of October).
 - Sort by **name**, **date** or **rating**, ascending or descending
 
 ### Viewing
@@ -112,6 +121,18 @@ Despite all of the above, it actually does stuff:
 | `I` | Toggle info panel |
 | `S` | Toggle film strip (large view) |
 
+With a clip in the large view:
+
+| Key | Action |
+|---|---|
+| `Space` / `K` / click the picture | Play / pause |
+| `,` `.` | Previous / next frame |
+| `J` `L` | Back / forward 5 seconds |
+| `[` `]` | Trim: keep from here / up to here |
+| `M` | Mute |
+| `\` | Show the original (no color edits) |
+| Double-click a slider or levels handle | Reset it |
+
 ---
 
 ## Building
@@ -138,13 +159,15 @@ On Linux the folder picker goes through the XDG desktop portal (`xdg-desktop-por
 
 The first build takes a while because `rawler` is chunky. Go make coffee. ☕
 
+Clips need `ffmpeg` and `ffprobe` on your `PATH` at runtime (any recent build; `apt install ffmpeg`, `scoop install ffmpeg`, `brew install ffmpeg`), or set `SLOPSHOT_FFMPEG` to the ffmpeg executable. Without it, photos work as before and clips show "no preview". On Linux the player's sound goes through ALSA, so building needs the ALSA headers (`libasound2-dev` / `alsa-lib-devel`).
+
 There are tests now, which is a sentence nobody expected to read in this README:
 
 ```sh
 cargo test
 ```
 
-They cover CR3 box walking, a whole synthetic CR3 end to end, XMP ratings, Canon AF maths, film strip layout, culling with a filter on, recursive opening and its sidecar, export name clashes, and one cursed file that used to crash a worker thread. They were also written by an AI. Obviously.
+They cover CR3 box walking, a whole synthetic CR3 end to end, XMP ratings, Canon AF maths, film strip layout, culling with a filter on, recursive opening and its sidecar, export name clashes, clip probing, the color math (preview and export LUT agreeing), clip export through the real ffmpeg with every encoder found, and one cursed file that used to crash a worker thread. They were also written by an AI. Obviously.
 
 ---
 
@@ -170,12 +193,15 @@ SLOPSHOT_SAMPLES=~/Pictures/shoot cargo test --release samples -- --ignored --no
 
 ## Known limitations
 
-- Only Sony `.ARW` and Canon `.CR3` files
+- Only Sony `.ARW` and Canon `.CR3` photos (plus video clips)
 - The RAW-develop fallback has no camera tone curve, so it looks flatter than the camera JPEG. It's brightness-matched to the preview, but it isn't a raw editor.
 - Mirrored orientations (EXIF 2/4/5/7) aren't handled. Your camera almost certainly never writes them.
 - One full-res image is kept in memory at a time (~100–200 MB for 24–26 MP)
 - Marks made in a recursive open stay in the root's file. Opening a subfolder on its own doesn't see them, and once the root's file exists, marks made in a subfolder on its own aren't picked up by it.
 - "Every subfolder" means every subfolder, including hidden ones like `.Trash-1000`.
+- Clips: color editing is for regular (SDR, Rec.709) footage. HDR clips (HLG/PQ) can be trimmed and compressed and stay HDR, but the color panel is off for them, and there's no LUT loading for log footage (S-Log, C-Log) yet.
+- Jumping to a new spot in a clip takes about half a second for 4K (a fresh decode from the previous keyframe); the keyframe cache covers scrubbing in the meantime.
+- Clip export uses Intel/NVIDIA GPU encoders or the CPU. AMD and Linux VAAPI encoders aren't wired up, so on those machines it falls back to x265/x264.
 
 ---
 

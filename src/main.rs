@@ -2,6 +2,7 @@ mod cr3;
 mod exposure;
 mod pixels;
 mod raw;
+mod video;
 
 use eframe::egui::{
     self, pos2, vec2, Align, Align2, Color32, ColorImage, Key, Layout, Pos2, Rect, RichText, Sense, Stroke,
@@ -55,10 +56,13 @@ enum Flag {
     Rejected,
 }
 
-#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default, Debug)]
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Default, Debug)]
 struct Mark {
     rating: u8,
     flag: Flag,
+    /// A clip's trim and colour.
+    #[serde(default, skip_serializing_if = "video::Edit::is_none")]
+    edit: video::Edit,
 }
 
 /// Decoded pixels as they came out of the JPEG (unrotated, unexposed), kept so the
@@ -66,11 +70,20 @@ struct Mark {
 struct Src {
     rgb: image::RgbImage,
     orientation: u16,
+    /// A clip's thumbnail shows its grade instead of the display exposure.
+    grade: Option<video::Grade>,
 }
 
 impl Src {
     fn render(&self, ev: f32) -> ColorImage {
-        pixels::render(&self.rgb, self.orientation, &exposure::lut(ev))
+        match &self.grade {
+            Some(g) => {
+                let mut out = vec![0; self.rgb.as_raw().len()];
+                g.tables().apply(self.rgb.as_raw(), &mut out);
+                ColorImage::from_rgb([self.rgb.width() as usize, self.rgb.height() as usize], &out)
+            }
+            None => pixels::render(&self.rgb, self.orientation, &exposure::lut(ev)),
+        }
     }
 }
 
@@ -91,9 +104,15 @@ impl Shown {
         Self { tex, src, ev }
     }
     fn set_ev(&mut self, ev: f32) {
-        if (self.ev - ev).abs() > 0.005 {
+        if self.src.grade.is_none() && (self.ev - ev).abs() > 0.005 {
             self.tex.set(self.src.render(ev), TextureOptions::LINEAR);
             self.ev = ev;
+        }
+    }
+    fn set_grade(&mut self, g: video::Grade) {
+        if self.src.grade.is_some_and(|old| old != g) {
+            self.src.grade = Some(g);
+            self.tex.set(self.src.render(0.0), TextureOptions::LINEAR);
         }
     }
 }
@@ -117,6 +136,9 @@ struct Photo {
     exif: raw::Exif,
     orientation: u16,
     sibling_jpg: bool,
+    is_video: bool,
+    /// A clip's metadata, once probed.
+    video: Option<video::VideoMeta>,
 }
 
 impl Photo {
@@ -221,7 +243,7 @@ fn walk(root: &Path, recursive: bool, found: &AtomicUsize, cancel: &AtomicBool) 
                 if recursive {
                     stack.push(path);
                 }
-            } else if meta.is_file() && is_raw(&path) {
+            } else if meta.is_file() && (is_raw(&path) || video::is_video(&path)) {
                 tree.files.push((path, meta.modified().ok()));
                 found.fetch_add(1, Ordering::Relaxed);
             }
@@ -272,7 +294,6 @@ fn scan(root: PathBuf, recursive: bool, found: &AtomicUsize, cancel: &AtomicBool
                 .unwrap_or_default();
             let mark = marks.remove(&rel).unwrap_or_default();
             Photo {
-                path,
                 name,
                 rel,
                 date,
@@ -282,6 +303,9 @@ fn scan(root: PathBuf, recursive: bool, found: &AtomicUsize, cancel: &AtomicBool
                 exif: raw::Exif::default(),
                 orientation: 1,
                 sibling_jpg: false,
+                is_video: video::is_video(&path),
+                video: None,
+                path,
             }
         })
         .collect();
@@ -334,7 +358,7 @@ impl Job {
 }
 
 enum Done {
-    Thumb { epoch: u64, idx: usize, img: Option<image::RgbImage>, meta: Option<raw::RawMeta>, auto_ev: f32, sibling: bool },
+    Thumb { epoch: u64, idx: usize, img: Option<image::RgbImage>, meta: Option<raw::RawMeta>, auto_ev: f32, sibling: bool, clip: Option<Box<video::VideoMeta>> },
     Full { epoch: u64, idx: usize, img: Option<(ColorImage, Src, f32)> },
     HiRes { epoch: u64, idx: usize, img: Option<HiResImg> },
 }
@@ -451,17 +475,21 @@ fn spawn_workers(ctx: &egui::Context, thumbs: &Arc<Queue>, fulls: &Arc<Queue>) -
                         continue;
                     }
                     let done = match job {
+                        Job::Thumb(epoch, idx, path) if video::is_video(&path) => {
+                            let (img, clip) = video::thumbnail(&path);
+                            Done::Thumb { epoch, idx, img, meta: None, auto_ev: 0.0, sibling: false, clip: clip.map(Box::new) }
+                        }
                         Job::Thumb(epoch, idx, path) => {
                             let (img, meta) = decode(&path, 4);
                             let auto_ev = img.as_ref().map_or(0.0, exposure::auto_ev);
                             let sibling = sibling_jpg(&path).is_some();
-                            Done::Thumb { epoch, idx, img, meta, auto_ev, sibling }
+                            Done::Thumb { epoch, idx, img, meta, auto_ev, sibling, clip: None }
                         }
                         Job::HiRes(epoch, idx, path, orientation, manual_ev, auto, preview_auto) => {
                             let img = decode_hires(&path).map(|(rgb, source)| {
                                 let auto_ev = exposure::auto_ev(&rgb);
                                 let ev = hires_ev(manual_ev, auto, auto_ev, preview_auto);
-                                let src = Src { rgb, orientation };
+                                let src = Src { rgb, orientation, grade: None };
                                 HiResImg { shown: src.render(ev), src, ev, auto_ev, source }
                             });
                             Done::HiRes { epoch, idx, img }
@@ -469,7 +497,7 @@ fn spawn_workers(ctx: &egui::Context, thumbs: &Arc<Queue>, fulls: &Arc<Queue>) -
                         Job::Full(epoch, idx, path, ev) => {
                             let (rgb, meta) = decode(&path, 1);
                             let img = rgb.zip(meta).map(|(rgb, m)| {
-                                let src = Src { rgb, orientation: m.orientation };
+                                let src = Src { rgb, orientation: m.orientation, grade: None };
                                 (src.render(ev), src, ev)
                             });
                             Done::Full { epoch, idx, img }
@@ -491,6 +519,8 @@ fn spawn_workers(ctx: &egui::Context, thumbs: &Arc<Queue>, fulls: &Arc<Queue>) -
 struct Export {
     total: usize,
     done: Arc<AtomicUsize>,
+    /// Set when the export includes clips: the one being encoded and a cancel switch.
+    clips: Option<Arc<video::ui::ClipProgress>>,
     result: mpsc::Receiver<String>,
 }
 
@@ -532,6 +562,13 @@ enum FlagFilter {
     Rejected,
     Unflagged,
     NotRejected,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum KindFilter {
+    All,
+    Photos,
+    Clips,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -608,11 +645,16 @@ struct App {
     viewer_at: Option<(usize, std::time::Instant)>,
     export: Option<Export>,
     status: String,
+    /// The clip player, colour panel and clip export settings.
+    video: video::ui::VideoState,
+    /// Marks changed while a slider or handle is held; saved once it's let go.
+    marks_dirty: bool,
 
     ev: f32,
     auto_bright: bool,
 
     f_name: String,
+    f_kind: KindFilter,
     f_min_rating: u8,
     f_flag: FlagFilter,
     f_from: String,
@@ -661,9 +703,12 @@ impl App {
             viewer_at: None,
             export: None,
             status: String::new(),
+            video: video::ui::VideoState::new(ctx),
+            marks_dirty: false,
             ev: 0.0,
             auto_bright: true,
             f_name: String::new(),
+            f_kind: KindFilter::All,
             f_min_rating: 0,
             f_flag: FlagFilter::All,
             f_from: String::new(),
@@ -683,7 +728,7 @@ impl App {
 
     /// Ask for a folder and open it.
     fn pick_folder(&mut self, ctx: &egui::Context, recursive: bool) {
-        let title = if recursive { "Open folder and its subfolders" } else { "Open folder with RAW files" };
+        let title = if recursive { "Open folder and its subfolders" } else { "Open folder with photos and clips" };
         if let Some(dir) = rfd::FileDialog::new().set_title(title).pick_folder() {
             self.open_folder(ctx, dir, recursive);
         }
@@ -728,7 +773,8 @@ impl App {
             self.thumbs.push_back(Job::Thumb(self.epoch, i, p.path.clone()));
         }
 
-        self.status = format!("Loaded {} RAW file(s) from {}", photos.len(), dir.display());
+        let clips = photos.iter().filter(|p| p.is_video).count();
+        self.status = format!("Loaded {} photo(s) and {clips} clip(s) from {}", photos.len() - clips, dir.display());
         if recursive {
             self.status += " and its subfolders";
         }
@@ -750,6 +796,7 @@ impl App {
         self.hires_requested = None;
         self.hires_failed.clear();
         self.scroll_off = 0.0;
+        self.video.close();
     }
 
     fn display_ev(&self, idx: usize) -> f32 {
@@ -778,7 +825,7 @@ impl App {
         }
         let jobs: Vec<Job> = want
             .iter()
-            .filter(|&&i| !self.full.contains_key(&i) && !self.full_requested.contains(&i))
+            .filter(|&&i| !self.photos[i].is_video && !self.full.contains_key(&i) && !self.full_requested.contains(&i))
             .map(|&i| Job::Full(self.epoch, i, self.photos[i].path.clone(), self.display_ev(i)))
             .collect();
         self.full_requested.extend(jobs.iter().map(Job::idx));
@@ -801,6 +848,11 @@ impl App {
             .filter(|&i| {
                 let p = &self.photos[i];
                 (name.is_empty() || p.rel.to_lowercase().contains(&name))
+                    && match self.f_kind {
+                        KindFilter::All => true,
+                        KindFilter::Photos => !p.is_video,
+                        KindFilter::Clips => p.is_video,
+                    }
                     && p.mark.rating >= self.f_min_rating
                     && match self.f_flag {
                         FlagFilter::All => true,
@@ -850,8 +902,13 @@ impl App {
     }
 
     fn handle_keys(&mut self, ctx: &egui::Context, vis: &[usize]) {
-        if ctx.wants_keyboard_input() || self.ask_recursive.is_some() {
+        if ctx.wants_keyboard_input() || self.ask_recursive.is_some() || self.video.dialog {
             return;
+        }
+        // In the clip player, Space plays and pauses instead of leaving.
+        let clip = self.selected.filter(|&s| self.viewing && self.photos[s].is_video);
+        if let Some(idx) = clip {
+            self.video_keys(ctx, idx);
         }
         let at = self.selected.and_then(|s| locate(vis, s, self.anchor));
         let mut actions = Vec::new();
@@ -872,7 +929,7 @@ impl App {
                 if i.key_pressed(Key::Plus) || i.key_pressed(Key::Equals) { self.zoom_cmd = Some(ZoomCmd::By(1.25, None)) }
                 if i.key_pressed(Key::Minus) { self.zoom_cmd = Some(ZoomCmd::By(0.8, None)) }
             }
-            if (i.key_pressed(Key::Enter) || i.key_pressed(Key::Space)) && self.selected.is_some() {
+            if (i.key_pressed(Key::Enter) || (i.key_pressed(Key::Space) && clip.is_none())) && self.selected.is_some() {
                 self.viewing = !self.viewing;
             }
             let Some(sel) = self.selected else { return };
@@ -898,17 +955,29 @@ impl App {
     }
 
     fn start_export(&mut self, ctx: &egui::Context) {
-        let files: Vec<(PathBuf, String)> = self
-            .photos
-            .iter()
-            .filter(|p| p.mark.flag == Flag::Picked)
-            .map(|p| (p.path.clone(), p.rel.clone()))
-            .collect();
-        if files.is_empty() {
+        let picked: Vec<&Photo> = self.photos.iter().filter(|p| p.mark.flag == Flag::Picked).collect();
+        if picked.is_empty() {
             self.status = "Nothing is picked yet — press P on a photo to pick it.".into();
-            return;
+        } else if picked.iter().any(|p| p.is_video) {
+            self.video.dialog = true; // how to export the clips first
+        } else {
+            self.export_to(ctx, None);
         }
-        let Some(dest) = rfd::FileDialog::new().set_title("Export picked photos to…").pick_folder() else {
+    }
+
+    /// Copy the picked photos and, with `clips`, export the picked clips with those settings.
+    fn export_to(&mut self, ctx: &egui::Context, clips: Option<video::export::Settings>) {
+        let picked = || self.photos.iter().filter(|p| p.mark.flag == Flag::Picked);
+        let files: Vec<(PathBuf, String)> = picked().filter(|p| !p.is_video).map(|p| (p.path.clone(), p.rel.clone())).collect();
+        let jobs: Vec<(video::export::Job, String)> = match clips {
+            Some(_) => picked()
+                .filter(|p| p.is_video)
+                .filter_map(|p| Some((video::export::Job { src: p.path.clone(), meta: p.video.clone()?, edit: p.mark.edit }, p.rel.clone())))
+                .collect(),
+            None => Vec::new(),
+        };
+        let unread = picked().filter(|p| p.is_video && p.video.is_none()).count();
+        let Some(dest) = rfd::FileDialog::new().set_title("Export picked files to…").pick_folder() else {
             return;
         };
         if self.folder.as_deref() == Some(dest.as_path()) {
@@ -922,10 +991,23 @@ impl App {
         }
         let (tx, rx) = mpsc::channel();
         let done = Arc::new(AtomicUsize::new(0));
-        self.export = Some(Export { total: files.len(), done: done.clone(), result: rx });
+        let progress = Arc::new(video::ui::ClipProgress::default());
+        let total = files.len() + jobs.len();
+        self.export = Some(Export { total, done: done.clone(), clips: (!jobs.is_empty()).then(|| progress.clone()), result: rx });
         let ctx = ctx.clone();
         std::thread::spawn(move || {
-            let _ = tx.send(run_export(files, dest, done, ctx));
+            let mut msg = Vec::new();
+            if !files.is_empty() {
+                msg.push(run_export(files, dest.clone(), done.clone(), ctx.clone()));
+            }
+            if let (Some(s), false) = (clips, jobs.is_empty()) {
+                msg.push(video::ui::export_clips(jobs, dest, s, done, progress, ctx.clone()));
+            }
+            if unread > 0 {
+                msg.push(format!("{unread} clip(s) skipped: not read yet or unreadable"));
+            }
+            let _ = tx.send(msg.join(" · "));
+            ctx.request_repaint();
         });
     }
 
@@ -949,10 +1031,17 @@ impl App {
         }
         while let Ok(d) = self.done_rx.try_recv() {
             match d {
-                Done::Thumb { epoch, idx, img, meta, auto_ev, sibling } if epoch == self.epoch => {
+                Done::Thumb { epoch, idx, img, meta, auto_ev, sibling, clip } if epoch == self.epoch => {
                     let p = &mut self.photos[idx];
                     p.auto_ev = auto_ev;
                     p.sibling_jpg = sibling;
+                    if let Some(c) = clip {
+                        if let Some(t) = c.created {
+                            p.date = chrono::DateTime::<chrono::Local>::from(t).format("%Y-%m-%d %H:%M:%S").to_string();
+                        }
+                        (p.exif.width, p.exif.height) = (c.width, c.height);
+                        p.video = Some(*c);
+                    }
                     if let Some(m) = meta {
                         if let Some(d) = m.date {
                             p.date = d;
@@ -965,8 +1054,9 @@ impl App {
                         }
                     }
                     let ev = self.ev + if self.auto_bright { auto_ev } else { 0.0 };
+                    let grade = p.is_video.then_some(p.mark.edit.grade);
                     p.thumb = match img {
-                        Some(rgb) => Thumb::Ready(Shown::new(ctx, &p.name, Src { rgb, orientation: p.orientation }, ev)),
+                        Some(rgb) => Thumb::Ready(Shown::new(ctx, &p.name, Src { rgb, orientation: p.orientation, grade }, ev)),
                         None => Thumb::Failed,
                     };
                 }
@@ -1006,6 +1096,8 @@ impl App {
             if let Ok(msg) = ex.result.try_recv() {
                 self.status = msg;
                 self.export = None;
+            } else if ex.clips.is_some() {
+                ctx.request_repaint_after(std::time::Duration::from_millis(200));
             }
         }
     }
@@ -1031,7 +1123,7 @@ impl App {
                 ui.separator();
                 if let Some(s) = &self.scan {
                     ui.spinner();
-                    ui.label(format!("Scanning… {} RAW file(s) found", s.found.load(Ordering::Relaxed)))
+                    ui.label(format!("Scanning… {} file(s) found", s.found.load(Ordering::Relaxed)))
                         .on_hover_text(s.dir.display().to_string());
                     if ui.button("Cancel").clicked() {
                         self.cancel_scan();
@@ -1040,7 +1132,7 @@ impl App {
                 }
                 ui.label("☀");
                 ui.add(egui::Slider::new(&mut self.ev, -2.0..=3.0).step_by(0.1).suffix(" EV"))
-                    .on_hover_text("Display brightness only — files are never changed");
+                    .on_hover_text("Display brightness of photos only — files are never changed. Clips have their own color panel.");
                 ui.checkbox(&mut self.auto_bright, "Auto")
                     .on_hover_text("Brighten/darken each photo to a normal exposure (A)");
                 if ui.add_enabled(self.ev != 0.0, egui::Button::new("Reset").small()).clicked() {
@@ -1051,10 +1143,20 @@ impl App {
                     let picked = self.photos.iter().filter(|p| p.mark.flag == Flag::Picked).count();
                     if let Some(ex) = &self.export {
                         let d = ex.done.load(Ordering::Relaxed);
+                        let (clip, label) = match &ex.clips {
+                            Some(c) => (c.clip.load(Ordering::Relaxed) as f32 / 1000.0, c.label.lock().unwrap().clone()),
+                            None => (0.0, String::new()),
+                        };
+                        if let Some(c) = &ex.clips
+                            && ui.button("Cancel").on_hover_text("Stop after removing the half-written clip").clicked()
+                        {
+                            c.cancel.store(true, Ordering::Relaxed);
+                        }
+                        let text = if label.is_empty() { format!("Copying {d}/{}", ex.total) } else { format!("{label} · {:.0}%", clip * 100.0) };
                         ui.add(
-                            egui::ProgressBar::new(d as f32 / ex.total as f32)
-                                .desired_width(200.0)
-                                .text(format!("Copying {d}/{}", ex.total)),
+                            egui::ProgressBar::new(((d as f32 + clip) / ex.total as f32).min(1.0))
+                                .desired_width(320.0)
+                                .text(text),
                         );
                     } else if ui
                         .add_enabled(picked > 0, egui::Button::new(format!("⮫ Export ({picked} picked)…")))
@@ -1088,9 +1190,11 @@ impl App {
                     ui.separator();
                 }
                 let shown = vis.len();
+                let clips = self.photos.iter().filter(|p| p.is_video).count();
+                let clips = if clips > 0 { format!(" · {clips} clips") } else { String::new() };
                 ui.label(format!(
-                    "{} photos · {shown} shown · {} picked · {} rejected",
-                    self.photos.len(),
+                    "{} photos{clips} · {shown} shown · {} picked · {} rejected",
+                    self.photos.len() - self.photos.iter().filter(|p| p.is_video).count(),
                     count(Flag::Picked),
                     count(Flag::Rejected)
                 ));
@@ -1107,6 +1211,14 @@ impl App {
             ui.add_space(4.0);
             ui.label("Name contains");
             ui.add(egui::TextEdit::singleline(&mut self.f_name).hint_text("e.g. 0067"));
+
+            ui.add_space(6.0);
+            ui.label("Show");
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut self.f_kind, KindFilter::All, "All");
+                ui.selectable_value(&mut self.f_kind, KindFilter::Photos, "Photos");
+                ui.selectable_value(&mut self.f_kind, KindFilter::Clips, "▶ Clips");
+            });
 
             ui.add_space(6.0);
             ui.label("Minimum rating");
@@ -1148,6 +1260,7 @@ impl App {
             ui.add_space(6.0);
             if ui.button("Reset filters").clicked() {
                 self.f_name.clear();
+                self.f_kind = KindFilter::All;
                 self.f_min_rating = 0;
                 self.f_flag = FlagFilter::All;
                 self.f_from.clear();
@@ -1182,7 +1295,14 @@ impl App {
                      Double-click  100% here / fit\n\
                      F  show focus point\n\
                      S  film strip\n\
-                     Drag  pan",
+                     Drag  pan\n\
+                     \n\
+                     Clips\n\
+                     Space/K  play · pause\n\
+                     , .  previous/next frame\n\
+                     J L  back/forward 5 s\n\
+                     [ ]  trim start/end here\n\
+                     M  mute · \\  show original",
                 )
                 .small()
                 .weak(),
@@ -1464,6 +1584,13 @@ impl App {
             ui.add_space(6.0);
             ui.heading("Info");
             ui.add_space(4.0);
+            if p.is_video {
+                match &p.video {
+                    Some(m) => video::ui::clip_info(ui, &p.path, &p.rel, &p.date, m),
+                    None => _ = ui.label(RichText::new("Reading clip…").weak()),
+                }
+                return;
+            }
             let focal = e.focal_length().map(|f| match e.focal35 {
                 Some(eq) if Some(eq as f32) != e.focal.map(f32::round) => format!("{f} ({eq}mm full-frame eq.)"),
                 _ => f,
@@ -1674,7 +1801,13 @@ fn film_strip(ui: &egui::Ui, photos: &[Photo], strip: &Strip, rect: Rect, action
         let resp = ui.interact(frame, ui.id().with(("strip", k)), Sense::click()).on_hover_text(&p.rel);
         let pic = match &p.thumb {
             // Greyed out right down when it has just dropped out of the filter.
-            Thumb::Ready(s) => paint_fit(ui, &s.tex, frame.shrink(2.0), if i == current && gone { Color32::from_gray(60) } else { dim(p) }),
+            Thumb::Ready(s) => {
+                let pic = paint_fit(ui, &s.tex, frame.shrink(2.0), if i == current && gone { Color32::from_gray(60) } else { dim(p) });
+                if p.is_video {
+                    video::ui::badge(ui, pic, None, &p.mark.edit, true);
+                }
+                pic
+            }
             Thumb::Pending => {
                 painter.text(frame.center(), Align2::CENTER_CENTER, "…", egui::FontId::proportional(14.0), Color32::GRAY);
                 frame
@@ -1732,6 +1865,9 @@ fn card(ui: &mut egui::Ui, p: &Photo, idx: usize, selected: bool, show_focus: bo
     match &p.thumb {
         Thumb::Ready(s) => {
             let fitted = paint_fit(&ui, &s.tex, img_rect, dim(p));
+            if p.is_video {
+                video::ui::badge(&ui, fitted, p.video.as_ref(), &p.mark.edit, false);
+            }
             if let (true, Some((c, _))) = (show_focus, p.focus_uv()) {
                 let at = fitted.min + c * fitted.size();
                 ui.painter().circle(at, 3.5, GREEN, Stroke::new(1.0, Color32::from_black_alpha(160)));
@@ -1741,7 +1877,8 @@ fn card(ui: &mut egui::Ui, p: &Photo, idx: usize, selected: bool, show_focus: bo
             ui.put(img_rect, egui::Spinner::new());
         }
         Thumb::Failed => {
-            ui.put(img_rect, egui::Label::new(RichText::new("no preview").weak()));
+            let msg = if p.is_video { "▶ clip — no preview\n(is ffmpeg installed?)" } else { "no preview" };
+            ui.put(img_rect, egui::Label::new(RichText::new(msg).weak()));
         }
     }
     if resp.double_clicked() {
@@ -1762,7 +1899,12 @@ fn card(ui: &mut egui::Ui, p: &Photo, idx: usize, selected: bool, show_focus: bo
         }
     });
     ui.label(RichText::new(&p.date).small().weak());
-    ui.label(RichText::new(p.exif.summary()).small().weak());
+    let summary = match &p.video {
+        Some(m) => m.summary(),
+        None if p.is_video => "clip".into(),
+        None => p.exif.summary(),
+    };
+    ui.label(RichText::new(summary).small().weak());
     ui.horizontal(|ui| mark_controls(ui, p, idx, 16.0, actions));
 }
 
@@ -1785,14 +1927,31 @@ impl eframe::App for App {
             self.center = vec2(0.5, 0.5);
             self.hires = None;
             self.viewer_at = None;
+            self.video.close();
+        }
+        // Edits are saved once the slider or handle being dragged is let go.
+        if self.marks_dirty && !ctx.input(|i| i.pointer.any_down()) {
+            self.marks_dirty = false;
+            self.save_marks();
+            if let Some(i) = self.video.thumb_dirty.take() {
+                let grade = self.photos[i].mark.edit.grade;
+                if let Thumb::Ready(s) = &mut self.photos[i].thumb {
+                    s.set_grade(grade);
+                }
+            }
         }
 
         self.recursive_prompt(ctx);
+        self.export_dialog(ctx);
         self.top_bar(ctx);
         self.bottom_bar(ctx, &vis);
         self.filter_panel(ctx);
         if let (true, Some(idx)) = (self.show_info && !self.photos.is_empty(), self.selected) {
-            self.info_panel(ctx, idx);
+            if self.viewing && self.photos[idx].is_video {
+                self.color_panel(ctx, idx);
+            } else {
+                self.info_panel(ctx, idx);
+            }
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -1804,7 +1963,7 @@ impl eframe::App for App {
                 let mut open = None;
                 ui.vertical_centered(|ui| {
                     ui.add_space((ui.available_height() - 90.0).max(0.0) / 2.0);
-                    if ui.button(RichText::new("📂 Open a folder of ARW/CR3 files…").size(20.0)).clicked() {
+                    if ui.button(RichText::new("📂 Open a folder of photos and clips…").size(20.0)).clicked() {
                         open = Some(false);
                     }
                     ui.add_space(8.0);
@@ -1818,11 +1977,16 @@ impl eframe::App for App {
                 return;
             }
             if self.photos.is_empty() {
-                let empty = if self.recursive { "No .ARW or .CR3 files in this folder or below it." } else { "No .ARW or .CR3 files in this folder." };
+                let empty = if self.recursive {
+                    "No .ARW, .CR3 or video files in this folder or below it."
+                } else {
+                    "No .ARW, .CR3 or video files in this folder."
+                };
                 ui.centered_and_justified(|ui| ui.label(empty));
                 return;
             }
             let actions = match (self.viewing, self.selected) {
+                (true, Some(idx)) if self.photos[idx].is_video => self.video_viewer(ui, idx, &vis),
                 (true, Some(idx)) => self.viewer(ui, idx, &vis),
                 _ => self.grid(ui, &vis),
             };
@@ -1944,7 +2108,7 @@ mod tests {
         l.photos.iter().find(|p| p.rel == rel).unwrap().mark
     }
 
-    const PICKED: Mark = Mark { rating: 0, flag: Flag::Picked };
+    const PICKED: Mark = Mark { rating: 0, flag: Flag::Picked, edit: video::Edit::NONE };
 
     fn save(l: &Listing) {
         let json = sidecar_json(&l.photos, &l.kept_marks, l.tree_sidecar);
@@ -2046,8 +2210,8 @@ mod tests {
         // Marked from the root too: the root's copy wins.
         d.file(".slopshot.json", r#"{"a/two.ARW":{"rating":1,"flag":"None"}}"#);
         let mut l = open(&d, true);
-        assert_eq!(mark(&l, "a/one.ARW"), Mark { rating: 3, flag: Flag::Picked });
-        assert_eq!(mark(&l, "a/two.ARW"), Mark { rating: 1, flag: Flag::None });
+        assert_eq!(mark(&l, "a/one.ARW"), Mark { rating: 3, flag: Flag::Picked, ..Mark::default() });
+        assert_eq!(mark(&l, "a/two.ARW"), Mark { rating: 1, flag: Flag::None, ..Mark::default() });
 
         // Clearing an imported mark sticks, though the subfolder's file still has it.
         l.photos[0].mark = Mark::default();
@@ -2065,6 +2229,39 @@ mod tests {
         assert_eq!(list_progress(7, Some(At::Gone(7))), Some((7, 0)));
         assert_eq!(list_progress(0, Some(At::Gone(0))), None);
         assert_eq!(list_progress(8, None), None);
+    }
+
+    #[test]
+    fn clips_are_listed_with_the_photos() {
+        let d = TempDir::new();
+        for f in ["DSC1.ARW", "C0001.MP4", "MVI_7358.mov", "notes.txt", "x.MP4.json"] {
+            d.file(f, "");
+        }
+        let l = open(&d, false);
+        assert_eq!(rels(&l), ["C0001.MP4", "DSC1.ARW", "MVI_7358.mov"]);
+        assert!(l.photos[0].is_video && !l.photos[1].is_video && l.photos[2].is_video);
+    }
+
+    /// A clip's trim and grade go in the sidecar next to its rating; untouched
+    /// photos keep the old two-field format, and old sidecars still load.
+    #[test]
+    fn clip_edits_round_trip_through_the_sidecar() {
+        let d = TempDir::new();
+        d.file("C0001.MP4", "");
+        d.file("DSC1.ARW", "");
+        d.file(SIDECAR, r#"{"DSC1.ARW": {"rating": 2, "flag": "Picked"}}"#);
+        let mut l = open(&d, false);
+        assert_eq!(mark(&l, "DSC1.ARW").rating, 2);
+        let edit = video::Edit { trim_in: 1.5, trim_out: Some(9.0), grade: video::Grade { exposure: 0.5, ..video::Grade::NONE } };
+        l.photos[0].mark.edit = edit;
+        save(&l);
+        let json = d.read(SIDECAR);
+        assert!(json.contains("\"trim_in\": 1.5") && json.contains("\"exposure\": 0.5"), "{json}");
+        let photo = json.split("\"DSC1.ARW\"").nth(1).unwrap();
+        assert!(!photo.contains("edit"), "photo marks stay as they were: {json}");
+        let l = open(&d, false);
+        assert_eq!(mark(&l, "C0001.MP4").edit, edit);
+        assert_eq!(mark(&l, "DSC1.ARW").edit, video::Edit::NONE);
     }
 
     /// Cameras reuse names across folders; flattening would silently drop picks.

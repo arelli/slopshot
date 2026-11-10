@@ -8,6 +8,7 @@ license = "MIT"
 members = ["xtask"]
 
 [dependencies]
+cpal = "0.18.2"
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 eframe = "0.33"
 image = { version = "0.25.10", default-features = false, features = ["jpeg"] }
